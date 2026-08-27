@@ -3,6 +3,7 @@ node_modules/
 dist/
 release/
 release-portable/
+release-portable-*/
 *.log
 backend/servers.json
 backend/servers.json.*.tmp
