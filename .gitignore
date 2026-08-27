@@ -1,0 +1,15 @@
+node_modules/
+.runtime/
+dist/
+release/
+release-portable/
+*.log
+backend/servers.json
+backend/servers.json.*.tmp
+backend/logs/
+backend/node_modules/
+work/
+release2/
+release3/
+release-rename-test/
+.DS_Store

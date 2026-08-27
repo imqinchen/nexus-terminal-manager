@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "settings": { "logRetention": "last-start" },
+  "groups": [],
+  "commands": [],
+  "workflows": [],
+  "schedules": []
+}
