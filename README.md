@@ -214,7 +214,7 @@ Electron 后端连接成功后，右侧是 xterm.js PTY 画布，不是静态文
 每个终端对应一个日志文件，源码运行时位于：
 
 ```text
-E:\airtest\terminal_maneger\backend\logs
+目录名\terminal_maneger\backend\logs
 ```
 
 执行服务启动动作时会清空该服务上一次启动产生的日志，之后 PTY/tmux 输出实时追加。日志页支持：
@@ -243,8 +243,8 @@ E:\airtest\terminal_maneger\backend\logs
 项目内置使用标准输入输出通信的本地 MCP Server，不监听额外网络端口。先启动 Nexus Electron，再在支持 MCP 的 Agent 中添加：
 
 ```powershell
-cd E:\airtest\terminal_maneger
-codex.cmd mcp add nexus-local -- node E:/airtest/terminal_maneger/mcp/server.cjs
+cd 用户目录\terminal_maneger
+codex.cmd mcp add nexus-local -- node 用户目录/terminal_maneger/mcp/server.cjs
 ```
 
 手动配置示例：
@@ -252,7 +252,7 @@ codex.cmd mcp add nexus-local -- node E:/airtest/terminal_maneger/mcp/server.cjs
 ```toml
 [mcp_servers.nexus-local]
 command = "node"
-args = ["E:/airtest/terminal_maneger/mcp/server.cjs"]
+args = ["目录名/terminal_maneger/mcp/server.cjs"]
 ```
 
 可用工具：
