@@ -34,9 +34,9 @@ import {
   Moon,
   MoreHorizontal,
   PanelLeft,
+  Pencil,
   Play,
   Plus,
-  Power,
   Radio,
   RefreshCw,
   Search,
@@ -52,7 +52,6 @@ import {
   Wifi,
   WifiOff,
   X,
-  Zap,
   Trash2,
 } from 'lucide-react';
 
@@ -427,9 +426,63 @@ function socketUrlFor(serverId) {
 
 function terminalPalette(theme) {
   if (theme === 'light') {
-    return { background: '#fbfcfd', foreground: '#24363c', cursor: '#339CFF', selectionBackground: '#cfe8ff', black: '#273238', red: '#b93643', green: '#14705c', yellow: '#8e5d0f', blue: '#1674d1', magenta: '#6c4c99', cyan: '#147888', white: '#eef2f3', brightBlack: '#687b83' };
+    return {
+      background: '#fbfcfd',
+      foreground: '#172a32',
+      cursor: '#1674d1',
+      selectionBackground: '#b9dcff',
+      scrollbarSliderBackground: '#819198aa',
+      scrollbarSliderHoverBackground: '#60737bcc',
+      scrollbarSliderActiveBackground: '#344950dd',
+      black: '#344a53',
+      red: '#ad2636',
+      // Keep mounted-drive directory backgrounds light while preserving a
+      // dark, readable foreground after xterm's contrast adjustment.
+      green: '#c7efdc',
+      yellow: '#81560a',
+      blue: '#07549c',
+      magenta: '#7043a5',
+      cyan: '#0b7184',
+      white: '#5c7079',
+      brightBlack: '#213943',
+      brightRed: '#8e1728',
+      brightGreen: '#075f4c',
+      brightYellow: '#624005',
+      brightBlue: '#084d9b',
+      brightMagenta: '#542a83',
+      brightCyan: '#075b6b',
+      brightWhite: '#172a32',
+    };
   }
-  return { background: '#0b1218', foreground: '#b8c9ca', cursor: '#75d8bd', selectionBackground: '#28524b', black: '#091015', red: '#ef8f8f', green: '#75d8bd', yellow: '#f3c778', blue: '#80adff', magenta: '#c4a6fa', cyan: '#70cbd0', white: '#e5efed', brightBlack: '#5e737e' };
+  return {
+    background: '#0b1218',
+    foreground: '#e7f2f1',
+    cursor: '#75d8bd',
+    selectionBackground: '#2d5e55',
+    scrollbarSliderBackground: '#81939d99',
+    scrollbarSliderHoverBackground: '#a9bcc2cc',
+    scrollbarSliderActiveBackground: '#d5e2e4dd',
+    black: '#7f949b',
+    red: '#ff9c9c',
+    // WSL mounted drives commonly emit 34;42 (blue on green). Keep the
+    // background subdued; xterm lifts the foreground to a readable value.
+    green: '#195642',
+    yellow: '#ffd37a',
+    // Keep blue/cyan readable when Linux emits a colored background (for
+    // example dircolors' 34;42 writable-directory style).
+    blue: '#8fc3ff',
+    magenta: '#d3b8ff',
+    cyan: '#a4eef0',
+    white: '#e7f2f1',
+    brightBlack: '#9aadb2',
+    brightRed: '#ffb3b3',
+    brightGreen: '#9cf2d8',
+    brightYellow: '#ffe39a',
+    brightBlue: '#d2deff',
+    brightMagenta: '#e4d1ff',
+    brightCyan: '#d2fbfc',
+    brightWhite: '#ffffff',
+  };
 }
 
 function App() {
@@ -656,6 +709,10 @@ function App() {
   };
 
   const runAction = (action, targetIds = [...selectedIds]) => {
+    if (action === 'start' || action === 'restart') {
+      showToast('启动流程请在服务编排中配置并执行', 'warning');
+      return;
+    }
     if (!targetIds.length) {
       showToast('请先勾选至少一个服务', 'warning');
       return;
@@ -717,6 +774,10 @@ function App() {
   });
 
   const runActionRemote = async (action, targetIds = [...selectedIds]) => {
+    if (action === 'start' || action === 'restart') {
+      showToast('启动流程请在服务编排中配置并执行', 'warning');
+      return;
+    }
     if (backendReady) {
       if (!targetIds.length) { showToast('No target services selected', 'warning'); return; }
       markBusy(targetIds, true);
@@ -862,14 +923,28 @@ function App() {
     showToast(`已添加终端 · ${trimmedName} · ${shellLabel(normalizedShell, language)}`);
   };
 
-  const createCommand = ({ name, command, description, scope, tone, executionMode = 'execute' }) => {
+  const saveCommand = ({ name, command, description, scope, tone, executionMode = 'execute' }, existingCommand = null) => {
     const trimmedName = name.trim();
     const storedCommand = executionMode === 'paste' ? command.replace(/^\s+/, '') : command.trim();
     if (!trimmedName || !storedCommand.trim()) return;
-    setCommands((current) => [{ id: makeId(trimmedName, 'command'), name: trimmedName, command: storedCommand, executionMode: executionMode === 'paste' ? 'paste' : 'execute', description: description.trim() || '自定义控制台指令', scope: scope.trim() || '当前选择', tone, runs: 0 }, ...current]);
+    const nextCommand = {
+      id: existingCommand?.id || makeId(trimmedName, 'command'),
+      name: trimmedName,
+      command: storedCommand,
+      executionMode: executionMode === 'paste' ? 'paste' : 'execute',
+      description: description.trim() || '自定义控制台指令',
+      scope: scope.trim() || '当前选择',
+      tone,
+      runs: Number(existingCommand?.runs) || 0,
+    };
+    setCommands((current) => existingCommand
+      ? current.map((item) => item.id === existingCommand.id ? nextCommand : item)
+      : [nextCommand, ...current]);
     setModal(null);
-    showToast(`已保存指令 · ${trimmedName}`);
+    showToast(existingCommand ? `已更新指令 · ${trimmedName}` : `已保存指令 · ${trimmedName}`);
   };
+
+  const createCommand = (form) => saveCommand(form);
 
   const copyCommand = async (command) => {
     try {
@@ -984,10 +1059,10 @@ function App() {
     if (!activeServer && activeNav === 'terminal') return <div className="empty-state panel"><Server size={28} /><strong>暂无服务配置</strong><span>创建一个终端后，可选择 WSL 工作目录或使用 /root。</span><button className="button primary" onClick={() => setModal({ type: 'server' })}><Plus size={15} />新建终端</button></div>;
     if (activeNav === 'terminal') return <RealTerminalPage theme={theme} servers={servers} activeServer={activeServer} activeServerId={activeServerId} setActiveServerId={setActiveServerId} lines={activeLines} query={terminalQuery} setQuery={setTerminalQuery} onSend={sendCommand} commands={commands} onUseCommand={(item) => item.executionMode === 'paste' ? queueTerminalPaste(activeServer.id, item.command) : sendCommand(activeServer.id, item.command)} pendingPaste={terminalPaste?.serverId === activeServer.id ? terminalPaste : null} onPasteComplete={(requestId) => { setTerminalPaste((current) => current?.id === requestId ? null : current); showToast(language === 'zh-CN' ? '指令已粘贴到终端，请补充参数' : 'Command pasted; complete its parameters'); }} onAddService={() => setModal({ type: 'server' })} />;
     if (activeNav === 'logs') return <LogsPage servers={servers} linesByServer={linesByServer} query={logQuery} setQuery={setLogQuery} onOpen={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} onOpenDirectory={() => { if (window.desktop?.openLogDirectory) window.desktop.openLogDirectory(); else showToast('请在 Electron 应用中打开日志目录', 'warning'); }} onOpenLogFile={(id) => { if (window.desktop?.openLogFile) window.desktop.openLogFile(id); else showToast('请在 Electron 应用中打开日志文件', 'warning'); }} backendReady={backendReady} />;
-    if (activeNav === 'commands') return <CommandsPage language={language} commands={filteredCommands} query={commandQuery} setQuery={setCommandQuery} groups={groups} selectedIds={selectedIds} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onClearSelection={() => setSelectedIds(new Set())} onRun={sendToSelectedRemote} onPaste={pasteCommandFromLibrary} onModeChange={updateCommandMode} onNew={() => setModal({ type: 'command' })} onImport={importCommandLibrary} onExport={exportCommandLibrary} onCopy={copyCommand} onDelete={deleteCommand} />;
+    if (activeNav === 'commands') return <CommandsPage language={language} commands={filteredCommands} query={commandQuery} setQuery={setCommandQuery} groups={groups} selectedIds={selectedIds} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onClearSelection={() => setSelectedIds(new Set())} onRun={sendToSelectedRemote} onPaste={pasteCommandFromLibrary} onModeChange={updateCommandMode} onNew={() => setModal({ type: 'command' })} onImport={importCommandLibrary} onExport={exportCommandLibrary} onCopy={copyCommand} onEdit={(item) => setModal({ type: 'command', command: item })} onDelete={deleteCommand} />;
     if (activeNav === 'orchestration') return <OrchestrationPage language={language} workflows={workflows} schedules={schedules} servers={servers} commands={commands.filter((command) => command.executionMode !== 'paste')} backendReady={backendReady} onWorkflowsChange={setWorkflows} onSchedulesChange={setSchedules} onRun={(id) => backendRequest(`/api/workflows/${encodeURIComponent(id)}/run`, { method: 'POST' }).then((run) => { showToast(language === 'zh-CN' ? '编排已开始' : 'Workflow started'); return run; }).catch((error) => { showToast(`${language === 'zh-CN' ? '编排启动失败' : 'Workflow failed to start'}: ${error.message}`, 'warning'); throw error; })} />;
     if (activeNav === 'overview') return <OverviewPage groups={groups} servers={servers} statusCounts={statusCounts} wsl={wsl} backendHealth={backendHealth} onOpenServiceManagement={() => setActiveNav('fleet')} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} />;
-    if (activeNav === 'fleet') return <ServiceManagementPage groups={groups} servers={servers} selectedIds={selectedIds} collapsedGroups={collapsedGroups} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onCollapse={toggleCollapsed} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} onAction={runActionRemote} onRemove={removeServerRemote} selectedServers={selectedServers} statusCounts={statusCounts} onSend={sendToSelectedRemote} onClearSelection={() => setSelectedIds(new Set())} onAddGroup={() => setModal({ type: 'group' })} onAddService={() => setModal({ type: 'server' })} />;
+    if (activeNav === 'fleet') return <ServiceManagementPage groups={groups} servers={servers} selectedIds={selectedIds} collapsedGroups={collapsedGroups} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onCollapse={toggleCollapsed} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} onAction={runActionRemote} onRemove={removeServerRemote} selectedServers={selectedServers} statusCounts={statusCounts} onSend={sendToSelectedRemote} onClearSelection={() => setSelectedIds(new Set())} onAddGroup={() => setModal({ type: 'group' })} onAddService={() => setModal({ type: 'server' })} onOpenOrchestration={() => setActiveNav('orchestration')} />;
     if (activeNav === 'settings') return <SettingsPage language={language} theme={theme} backendReady={backendReady} backendHealth={backendHealth} wsl={wsl} onLanguageChange={setLanguage} onThemeChange={setTheme} onReloadConfig={() => reloadBackendConfig()} onRuntimeHealth={(health) => { if (!health) return; setBackendHealth(health); setWsl((current) => ({ ...current, available: health.capabilities?.wsl ?? current.available, backend: true, distro: health.distro || current.distro })); }} onNotify={showToast} />;
     return <OverviewPage groups={groups} servers={servers} statusCounts={statusCounts} wsl={wsl} backendHealth={backendHealth} onOpenServiceManagement={() => setActiveNav('fleet')} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} />;
   };
@@ -1044,10 +1119,10 @@ function App() {
             <button className="avatar-button" title="账户设置">A</button>
           </div>
         </header>
-        <div className="content-scroll">{renderPage()}</div>
+        <div className={`content-scroll ${activeNav === 'terminal' ? 'content-scroll-terminal' : ''}`}>{renderPage()}</div>
       </main>
       {toast && <div className={`toast toast-${toast.tone}`}><CheckCircle2 size={17} />{toast.message}<button onClick={() => setToast(null)}><X size={14} /></button></div>}
-      {modal && <CreationModal language={language} type={modal.type} groups={groups} wsl={wsl} terminalProfiles={terminalProfiles} onClose={() => setModal(null)} onCreate={modal.type === 'group' ? createGroup : modal.type === 'server' ? createServer : createCommand} />}
+      {modal && <CreationModal key={`${modal.type}-${modal.command?.id || 'new'}`} language={language} type={modal.type} groups={groups} wsl={wsl} terminalProfiles={terminalProfiles} initialCommand={modal.command} onClose={() => setModal(null)} onCreate={modal.type === 'group' ? createGroup : modal.type === 'server' ? createServer : (form) => saveCommand(form, modal.command)} />}
     </div>
   );
 }
@@ -1123,15 +1198,15 @@ function OverviewPage({ groups, servers, statusCounts, wsl, backendHealth, onOpe
   </>;
 }
 
-function ServiceManagementPage({ groups, servers, selectedIds, collapsedGroups, onToggleGroup, onToggleServer, onCollapse, onSelectServer, onAction, onRemove, selectedServers, statusCounts, onSend, onClearSelection, onAddGroup, onAddService }) {
+function ServiceManagementPage({ groups, servers, selectedIds, collapsedGroups, onToggleGroup, onToggleServer, onCollapse, onSelectServer, onAction, onRemove, selectedServers, statusCounts, onSend, onClearSelection, onAddGroup, onAddService, onOpenOrchestration }) {
   const running = statusCounts.running || 0;
   const issues = (statusCounts.warning || 0) + (statusCounts.starting || 0);
   return <>
     <PageIntro
       eyebrow="SERVICE MANAGEMENT"
       title="服务管理"
-      description="勾选分组或终端，然后执行启动、停止、重启或批量命令。"
-      actions={<><button className="button secondary" onClick={onAddGroup}><Plus size={16} />新建分组</button><button className="button secondary" onClick={onAddService}><Plus size={16} />新建终端</button><button className="button primary" onClick={() => onAction('start')} disabled={!selectedIds.size}><Zap size={16} />启动已选</button></>}
+      description="勾选分组或终端，执行停止或批量命令；启动流程请在服务编排中配置。"
+      actions={<><button className="button secondary" onClick={onAddGroup}><Plus size={16} />新建分组</button><button className="button secondary" onClick={onAddService}><Plus size={16} />新建终端</button><button className="button primary" onClick={onOpenOrchestration}><GitBranch size={16} />服务编排</button></>}
     />
 
     <div className="metric-grid service-management-metrics">
@@ -1141,12 +1216,12 @@ function ServiceManagementPage({ groups, servers, selectedIds, collapsedGroups, 
       <MetricCard label="需要关注" value={issues} detail={`${statusCounts.stopped || 0} 个停止 · ${statusCounts.starting || 0} 个启动中`} icon={<AlertTriangle size={18} />} tone="amber" />
     </div>
 
-    <div className="selection-toolbar panel"><div><strong>已选择 {selectedIds.size} 个终端</strong><span>可按分组或单个终端进行选择。</span></div><div className="selection-actions"><button className="text-button" onClick={onClearSelection} disabled={!selectedIds.size}><Square size={14} />清空选择</button><button className="text-button" onClick={() => onAction('restart')} disabled={!selectedIds.size}><RefreshCw size={15} />重启已选</button><button className="text-button" onClick={() => onAction('stop')} disabled={!selectedIds.size}><Square size={14} />停止已选</button></div></div>
+    <div className="selection-toolbar panel"><div><strong>已选择 {selectedIds.size} 个终端</strong><span>可按分组或单个终端进行选择；开服请使用服务编排。</span></div><div className="selection-actions"><button className="text-button" onClick={onClearSelection} disabled={!selectedIds.size}><Square size={14} />清空选择</button><button className="text-button" onClick={() => onAction('stop')} disabled={!selectedIds.size}><Square size={14} />停止已选</button></div></div>
 
     <div className="section-heading"><div><h2>服务分组</h2><span>这里的选择状态会与指令库共享。</span></div><div className="section-actions"><button className="text-button" onClick={onAddGroup}><Plus size={15} />新建分组</button><button className="text-button" onClick={onAddService}><Plus size={15} />新建终端</button></div></div>
     <div className="fleet-stack">{groups.map((group) => <GroupPanel key={group.id} group={group} selectedIds={selectedIds} collapsed={collapsedGroups.has(group.id)} onToggleGroup={() => onToggleGroup(group)} onToggleServer={onToggleServer} onCollapse={() => onCollapse(group.id)} onSelectServer={onSelectServer} onAction={onAction} onRemove={onRemove} />)}{!groups.length && <div className="empty-state panel"><Layers3 size={28} /><strong>还没有服务分组</strong><span>创建分组或添加终端开始使用。</span><div><button className="button secondary" onClick={onAddGroup}><Plus size={15} />新建分组</button><button className="button primary" onClick={onAddService}><Plus size={15} />新建终端</button></div></div>}</div>
 
-    <div className="lower-grid"><QuickCommand onSend={onSend} selectedServers={selectedServers} /><section className="selection-help panel"><div className="panel-heading"><div><h3>批量操作流程</h3><span>本页所有操作都基于当前选择。</span></div><ListChecks size={18} className="panel-heading-icon" /></div><div className="selection-help-list"><div><Check size={15} /><span>选择分组即可选中其中的全部终端。</span></div><div><Terminal size={15} /><span>点击服务名称可以打开真实 PTY 终端。</span></div><div><Command size={15} /><span>指令库适合保存并重复广播常用命令。</span></div></div></section></div>
+    <div className="lower-grid"><QuickCommand onSend={onSend} selectedServers={selectedServers} /><section className="selection-help panel"><div className="panel-heading"><div><h3>批量操作流程</h3><span>本页所有操作都基于当前选择。</span></div><ListChecks size={18} className="panel-heading-icon" /></div><div className="selection-help-list"><div><Check size={15} /><span>选择分组即可选中其中的全部终端。</span></div><div><Terminal size={15} /><span>点击服务名称可以打开真实 PTY 终端。</span></div><div><Command size={15} /><span>指令库适合保存并重复广播常用命令。</span></div><div><GitBranch size={15} /><span>启动命令和执行顺序请在服务编排中配置。</span></div></div></section></div>
   </>;
 }
 
@@ -1233,7 +1308,7 @@ function SettingsPage({ language, theme, backendReady, backendHealth, wsl, onLan
 function LegacyDashboardPage({ activeNav, groups, servers, selectedIds, collapsedGroups, onToggleGroup, onToggleServer, onCollapse, onSelectServer, onAction, selectedServers, statusCounts, onSend, onAddGroup, onAddService }) {
   const isFleet = activeNav === 'fleet';
   return <>
-    <PageIntro eyebrow={isFleet ? 'SERVICE MANAGEMENT' : 'LOCAL OPERATIONS'} title={isFleet ? '服务管理' : '控制中心'} description={isFleet ? '选择服务分组，批量启动、停止或连接到任意实例。' : '你的本地服务都在这里。保持状态清晰，操作一步到位。'} actions={<><button className="button secondary" onClick={onAddService}><Plus size={16} />添加服务</button><button className="button primary" onClick={() => onAction('start')}><Zap size={16} />启动已选</button></>} />
+    <PageIntro eyebrow={isFleet ? 'SERVICE MANAGEMENT' : 'LOCAL OPERATIONS'} title={isFleet ? '服务管理' : '控制中心'} description={isFleet ? '选择服务分组，停止服务或连接到任意实例；启动流程请在服务编排中配置。' : '你的本地服务都在这里。保持状态清晰，操作一步到位。'} actions={<button className="button secondary" onClick={onAddService}><Plus size={16} />添加服务</button>} />
     <div className="metric-grid">
       <MetricCard label="服务总数" value={servers.length} detail={`${statusCounts.running || 0} 个正在运行`} icon={<Server size={18} />} tone="mint" />
        <MetricCard label="运行状态" value={`${servers.length ? Math.round(((statusCounts.running || 0) / servers.length) * 100) : 0}%`} detail={`${statusCounts.running || 0} running · ${statusCounts.stopped || 0} stopped`} icon={<Activity size={18} />} tone="blue" />
@@ -1241,7 +1316,7 @@ function LegacyDashboardPage({ activeNav, groups, servers, selectedIds, collapse
       <MetricCard label="今日操作" value="38" detail="最近一次 · 14:32:18" icon={<History size={18} />} tone="violet" />
     </div>
 
-    <div className="section-heading"><div><h2>服务分组</h2><span>{selectedIds.size} 个已选择 · {servers.filter((server) => server.status === 'running').length} 个运行中</span></div><div className="section-actions"><button className="text-button" onClick={onAddGroup}><Plus size={15} />新建分组</button><button className="text-button" onClick={() => onAction('restart')}><RefreshCw size={15} />重启已选</button><button className="text-button" onClick={() => onAction('stop')}><Square size={14} />停止已选</button><button className="icon-button"><SlidersHorizontal size={17} /></button></div></div>
+    <div className="section-heading"><div><h2>服务分组</h2><span>{selectedIds.size} 个已选择 · {servers.filter((server) => server.status === 'running').length} 个运行中</span></div><div className="section-actions"><button className="text-button" onClick={onAddGroup}><Plus size={15} />新建分组</button><button className="text-button" onClick={() => onAction('stop')}><Square size={14} />停止已选</button><button className="icon-button"><SlidersHorizontal size={17} /></button></div></div>
     <div className="fleet-stack">
       {groups.map((group) => <GroupPanel key={group.id} group={group} selectedIds={selectedIds} collapsed={collapsedGroups.has(group.id)} onToggleGroup={() => onToggleGroup(group)} onToggleServer={onToggleServer} onCollapse={() => onCollapse(group.id)} onSelectServer={onSelectServer} onAction={onAction} />)}
     </div>
@@ -1270,7 +1345,8 @@ function MinusIcon() { return <span className="minus-icon" />; }
 function ServerRow({ server, selected, onToggle, onSelect, onAction, onRemove }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const status = statusMeta[server.status];
-  return <div className={`server-row ${selected ? 'selected' : ''}`}><button className={`row-check ${selected ? 'checked' : ''}`} onClick={onToggle}>{selected && <Check size={13} />}</button><div className="server-identity" onClick={onSelect}><div className={`server-icon server-icon-${server.status}`}><Server size={16} /></div><div><strong>{server.name}</strong><span>{server.label} <i /> :{server.port || '—'}</span></div></div><div className={`status-badge ${status.className}`}><span>{status.dot}</span>{status.label}</div><div className="row-stat"><span>UPTIME</span><strong>{server.uptime}</strong></div><div className="row-stat"><span>PLAYERS</span><strong>{server.players}</strong></div><div className="row-stat"><span>MEMORY</span><strong>{server.memory}</strong></div><div className="row-actions"><button className="icon-button compact" onClick={() => onSelect()} title="打开终端"><Terminal size={15} /></button><button className="icon-button compact" onClick={() => onAction(server.status === 'running' ? 'stop' : 'start', [server.id])} title={server.status === 'running' ? '停止服务' : '启动服务'}>{server.status === 'running' ? <Square size={14} /> : <Play size={14} />}</button><button className="icon-button compact" title="更多操作" aria-label="更多操作" onClick={() => setMenuOpen((value) => !value)}><MoreHorizontal size={15} /></button>{menuOpen && <div className="row-menu server-row-menu"><button onClick={() => { onSelect(); setMenuOpen(false); }}><Terminal size={14} />打开终端</button><button onClick={() => { onAction(server.status === 'running' ? 'stop' : 'start', [server.id]); setMenuOpen(false); }}>{server.status === 'running' ? <Square size={14} /> : <Play size={14} />}{server.status === 'running' ? '停止服务' : '启动服务'}</button><button className="danger" onClick={() => { onRemove?.(server); setMenuOpen(false); }}><Trash2 size={14} />删除终端</button></div>}</div></div>;
+  const isRunning = server.status === 'running';
+  return <div className={`server-row ${selected ? 'selected' : ''}`}><button className={`row-check ${selected ? 'checked' : ''}`} onClick={onToggle}>{selected && <Check size={13} />}</button><div className="server-identity" onClick={onSelect}><div className={`server-icon server-icon-${server.status}`}><Server size={16} /></div><div><strong>{server.name}</strong><span>{server.label} <i /> :{server.port || '—'}</span></div></div><div className={`status-badge ${status.className}`}><span>{status.dot}</span>{status.label}</div><div className="row-stat"><span>UPTIME</span><strong>{server.uptime}</strong></div><div className="row-stat"><span>PLAYERS</span><strong>{server.players}</strong></div><div className="row-stat"><span>MEMORY</span><strong>{server.memory}</strong></div><div className="row-actions"><button className="icon-button compact" onClick={() => onSelect()} title="打开终端"><Terminal size={15} /></button>{isRunning && <button className="icon-button compact" onClick={() => onAction('stop', [server.id])} title="停止服务"><Square size={14} /></button>}<button className="icon-button compact" title="更多操作" aria-label="更多操作" onClick={() => setMenuOpen((value) => !value)}><MoreHorizontal size={15} /></button>{menuOpen && <div className="row-menu server-row-menu"><button onClick={() => { onSelect(); setMenuOpen(false); }}><Terminal size={14} />打开终端</button>{isRunning && <button onClick={() => { onAction('stop', [server.id]); setMenuOpen(false); }}><Square size={14} />停止服务</button>}<button className="danger" onClick={() => { onRemove?.(server); setMenuOpen(false); }}><Trash2 size={14} />删除终端</button></div>}</div></div>;
 }
 
 function RecentActivity({ servers }) {
@@ -1330,9 +1406,13 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
       convertEol: true,
       cursorBlink: false,
       cursorStyle: 'bar',
-      fontFamily: 'DM Mono, Consolas, monospace',
-      fontSize: 12,
-      lineHeight: 1.45,
+      fontFamily: 'Cascadia Mono, Cascadia Code, DM Mono, Consolas, monospace',
+      fontSize: 13,
+      fontWeight: 500,
+      lineHeight: 1.35,
+       // WSL `dircolors` uses background styles such as 34;42 for writable
+       // directories. Use a strong ratio so those labels remain readable.
+       minimumContrastRatio: 7,
       scrollback: 5000,
       theme: terminalPalette(theme),
     });
@@ -2021,7 +2101,7 @@ function LegacyCommandsPageV2({ language, commands, query, setQuery, groups, sel
   </>;
 }
 
-function CommandsPage({ language, commands, query, setQuery, groups, selectedIds, onToggleGroup, onToggleServer, onClearSelection, onRun, onPaste, onModeChange, onNew, onImport, onExport, onCopy, onDelete }) {
+function CommandsPage({ language, commands, query, setQuery, groups, selectedIds, onToggleGroup, onToggleServer, onClearSelection, onRun, onPaste, onModeChange, onNew, onImport, onExport, onCopy, onEdit, onDelete }) {
   const isZh = language === 'zh-CN';
   const [openId, setOpenId] = useState(null);
   const [fileAction, setFileAction] = useState('');
@@ -2031,15 +2111,15 @@ function CommandsPage({ language, commands, query, setQuery, groups, selectedIds
     try { await action(); } finally { setFileAction(''); }
   };
   const text = isZh ? {
-    title: '指令库', description: '保存可直接执行或粘贴后补参数的常用指令。', importLibrary: '导入命令库', exportLibrary: '导出命令库', newCommand: '新建指令', search: '搜索名称、指令或说明', selected: '个服务已选择', targets: '指令目标', targetHint: '直接执行支持多个终端；粘贴指令时只选择一个终端。', clear: '清空', copy: '复制指令', remove: '删除指令', run: '执行', paste: '粘贴', setExecute: '改为直接执行', setPaste: '改为粘贴到终端', executeMode: '直接执行', pasteMode: '粘贴后补参数', empty: '没有找到指令', emptyHint: '请新建指令或修改搜索条件。', noGroups: '还没有配置终端分组', runs: '次执行', current: '当前目标',
+    title: '指令库', description: '保存可直接执行或粘贴后补参数的常用指令。', importLibrary: '导入命令库', exportLibrary: '导出命令库', newCommand: '新建指令', search: '搜索名称、指令或说明', selected: '个服务已选择', targets: '指令目标', targetHint: '直接执行支持多个终端；粘贴指令时只选择一个终端。', clear: '清空', copy: '复制指令', edit: '编辑指令', remove: '删除指令', run: '执行', paste: '粘贴', setExecute: '改为直接执行', setPaste: '改为粘贴到终端', executeMode: '直接执行', pasteMode: '粘贴后补参数', empty: '没有找到指令', emptyHint: '请新建指令或修改搜索条件。', noGroups: '还没有配置终端分组', runs: '次执行', current: '当前目标',
   } : {
-    title: 'Command library', description: 'Save commands to execute or paste before adding parameters.', importLibrary: 'Import library', exportLibrary: 'Export library', newCommand: 'New command', search: 'Search name, command or description', selected: 'services selected', targets: 'Command targets', targetHint: 'Execute supports multiple terminals; select one terminal for paste commands.', clear: 'Clear', copy: 'Copy command', remove: 'Delete command', run: 'Run', paste: 'Paste', setExecute: 'Change to execute', setPaste: 'Change to paste', executeMode: 'Execute', pasteMode: 'Paste then edit', empty: 'No commands found', emptyHint: 'Create a command or change the search.', noGroups: 'No terminal groups configured', runs: 'runs', current: 'Current targets',
+    title: 'Command library', description: 'Save commands to execute or paste before adding parameters.', importLibrary: 'Import library', exportLibrary: 'Export library', newCommand: 'New command', search: 'Search name, command or description', selected: 'services selected', targets: 'Command targets', targetHint: 'Execute supports multiple terminals; select one terminal for paste commands.', clear: 'Clear', copy: 'Copy command', edit: 'Edit command', remove: 'Delete command', run: 'Run', paste: 'Paste', setExecute: 'Change to execute', setPaste: 'Change to paste', executeMode: 'Execute', pasteMode: 'Paste then edit', empty: 'No commands found', emptyHint: 'Create a command or change the search.', noGroups: 'No terminal groups configured', runs: 'runs', current: 'Current targets',
   };
   return <>
     <PageIntro eyebrow="COMMAND PALETTE" title={text.title} description={text.description} actions={<><button className="button secondary" onClick={() => runFileAction('import', onImport)} disabled={Boolean(fileAction)}><Upload size={16} />{text.importLibrary}</button><button className="button secondary" onClick={() => runFileAction('export', onExport)} disabled={Boolean(fileAction)}><Download size={16} />{text.exportLibrary}</button><button className="button primary" onClick={onNew}><Plus size={16} />{text.newCommand}</button></>} />
     <section className="command-targets panel"><div className="command-targets-header"><div><strong>{text.targets}</strong><span>{text.targetHint}</span></div><div className="command-targets-summary"><strong>{selectedIds.size}</strong> {text.selected}<button className="text-button" onClick={onClearSelection} disabled={!selectedIds.size}>{text.clear}</button></div></div><div className="command-target-groups">{groups.map((group) => { const ids = group.servers.map((server) => server.id); const count = ids.filter((id) => selectedIds.has(id)).length; const allSelected = ids.length > 0 && count === ids.length; const someSelected = count > 0 && !allSelected; return <div className="command-target-group" key={group.id}><div className="command-target-group-header"><button className={`group-check ${allSelected ? 'checked' : someSelected ? 'partial' : ''}`} onClick={() => onToggleGroup(group)} aria-label={`${text.selected} ${group.name}`}>{allSelected ? <Check size={14} /> : someSelected ? <MinusIcon /> : null}</button><span className={`group-accent accent-${group.accent}`} /><strong>{group.name}</strong><span>{count}/{ids.length}</span></div><div className="command-target-servers">{group.servers.map((server) => { const checked = selectedIds.has(server.id); return <button key={server.id} className={`command-target-server ${checked ? 'selected' : ''}`} onClick={() => onToggleServer(server.id)}><span className={`row-check ${checked ? 'checked' : ''}`}>{checked && <Check size={11} />}</span><span>{server.name}</span></button>; })}</div></div>; })}{!groups.length && <span className="command-target-empty">{text.noGroups}</span>}</div></section>
     <div className="command-toolbar"><label className="log-search"><Search size={17} /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder={text.search} /></label><div className="command-scope"><ListChecks size={16} /><strong>{selectedIds.size}</strong> {text.selected}</div></div>
-    <div className="command-grid">{commands.map((item) => { const paste = item.executionMode === 'paste'; return <div className="command-card panel" key={item.id}><div className={`command-card-icon tone-${item.tone}`}>{paste ? <ClipboardPaste size={17} /> : <Command size={17} />}</div><div className="command-card-main"><div className="command-card-title"><strong>{item.name}</strong><div className="command-card-menu-wrap"><button className="icon-button compact" onClick={() => setOpenId((current) => current === item.id ? null : item.id)} aria-expanded={openId === item.id} aria-label={isZh ? `操作 ${item.name}` : `Actions for ${item.name}`} title={isZh ? '指令操作' : 'Command actions'}><MoreHorizontal size={15} /></button>{openId === item.id && <div className="command-card-menu"><button onClick={() => { onCopy?.(item.command); setOpenId(null); }}><Copy size={14} />{text.copy}</button><button onClick={() => { onModeChange?.(item.id, paste ? 'execute' : 'paste'); setOpenId(null); }}>{paste ? <Play size={14} /> : <ClipboardPaste size={14} />}{paste ? text.setExecute : text.setPaste}</button><button className="danger" onClick={() => { onDelete?.(item.id); setOpenId(null); }}><X size={14} />{text.remove}</button></div>}</div></div><code>{item.command}</code><p>{item.description}</p><div className="command-card-meta"><span className={`command-mode-badge ${paste ? 'paste' : ''}`}>{paste ? text.pasteMode : text.executeMode}</span><span>{item.scope}</span><span><History size={13} />{item.runs || 0} {text.runs}</span></div></div><button className={`run-command ${paste ? 'paste-command' : ''}`} disabled={paste ? selectedIds.size !== 1 : !selectedIds.size} onClick={() => paste ? onPaste(item) : onRun(item.command)}>{paste ? <ClipboardPaste size={14} /> : <Play size={14} />}{paste ? text.paste : text.run}</button></div>; })}{!commands.length && <div className="empty-state command-empty"><Search size={26} /><strong>{text.empty}</strong><span>{text.emptyHint}</span></div>}</div>
+    <div className="command-grid">{commands.map((item) => { const paste = item.executionMode === 'paste'; return <div className="command-card panel" key={item.id}><div className={`command-card-icon tone-${item.tone}`}>{paste ? <ClipboardPaste size={17} /> : <Command size={17} />}</div><div className="command-card-main"><div className="command-card-title"><strong>{item.name}</strong><div className="command-card-menu-wrap"><button className="icon-button compact" onClick={() => setOpenId((current) => current === item.id ? null : item.id)} aria-expanded={openId === item.id} aria-label={isZh ? `操作 ${item.name}` : `Actions for ${item.name}`} title={isZh ? '指令操作' : 'Command actions'}><MoreHorizontal size={15} /></button>{openId === item.id && <div className="command-card-menu"><button onClick={() => { onEdit?.(item); setOpenId(null); }}><Pencil size={14} />{text.edit}</button><button onClick={() => { onCopy?.(item.command); setOpenId(null); }}><Copy size={14} />{text.copy}</button><button onClick={() => { onModeChange?.(item.id, paste ? 'execute' : 'paste'); setOpenId(null); }}>{paste ? <Play size={14} /> : <ClipboardPaste size={14} />}{paste ? text.setExecute : text.setPaste}</button><button className="danger" onClick={() => { onDelete?.(item.id); setOpenId(null); }}><X size={14} />{text.remove}</button></div>}</div></div><code>{item.command}</code><p>{item.description}</p><div className="command-card-meta"><span className={`command-mode-badge ${paste ? 'paste' : ''}`}>{paste ? text.pasteMode : text.executeMode}</span><span>{item.scope}</span><span><History size={13} />{item.runs || 0} {text.runs}</span></div></div><button className={`run-command ${paste ? 'paste-command' : ''}`} disabled={paste ? selectedIds.size !== 1 : !selectedIds.size} onClick={() => paste ? onPaste(item) : onRun(item.command)}>{paste ? <ClipboardPaste size={14} /> : <Play size={14} />}{paste ? text.paste : text.run}</button></div>; })}{!commands.length && <div className="empty-state command-empty"><Search size={26} /><strong>{text.empty}</strong><span>{text.emptyHint}</span></div>}</div>
   </>;
 }
 
@@ -2115,9 +2195,10 @@ function LegacyCreationModal({ type, groups, wsl, onClose, onCreate }) {
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="creation-modal" onSubmit={submit}><div className="modal-header"><div><div className="eyebrow">CONFIGURATION</div><h2>{title}</h2><p>{subtitle}</p></div><button type="button" className="icon-button" onClick={onClose}><X size={17} /></button></div><div className="modal-fields">{isGroup && <><Field label="分组名称" required value={form.name} onChange={(value) => update('name', value)} placeholder="例如：生存服群" /><Field label="描述" value={form.note} onChange={(value) => update('note', value)} placeholder="这个分组负责什么" /><div className="field"><label>标识色</label><div className="swatch-row">{['mint', 'blue', 'amber', 'violet'].map((tone) => <button type="button" key={tone} className={`swatch swatch-${tone} ${form.accent === tone ? 'selected' : ''}`} onClick={() => update('accent', tone)} aria-label={tone} />)}</div></div></>}{isServer && <><Field label="服务名称" required value={form.name} onChange={(value) => update('name', value)} placeholder="例如：Survival · Event" /><Field label="服务标签" value={form.label} onChange={(value) => update('label', value)} placeholder="例如：活动服" /><div className="field-row"><Field label="所属分组" required type="select" options={groups.map((group) => ({ value: group.id, label: group.name }))} value={form.groupId} onChange={(value) => update('groupId', value)} /><Field label="端口" value={form.port} onChange={(value) => update('port', value)} placeholder="25565" /></div><Field label="WSL 工作目录" value={form.dir} onChange={(value) => update('dir', value)} placeholder="/srv/servers/event" /></>}{!isGroup && !isServer && <><Field label="指令名称" required value={form.name} onChange={(value) => update('name', value)} placeholder="例如：安全保存" /><Field label="控制台指令" required mono value={form.command} onChange={(value) => update('command', value)} placeholder="save-all" /><Field label="说明" value={form.description} onChange={(value) => update('description', value)} placeholder="简短描述这个指令的作用" /><div className="field"><label>适用范围</label><div className="scope-options">{['当前选择', '全部游戏服', '生存服群', '单个服务'].map((scope) => <button type="button" key={scope} className={form.scope === scope ? 'selected' : ''} onClick={() => update('scope', scope)}>{scope}</button>)}</div></div></>}</div><div className="modal-footer"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" type="submit"><Check size={15} />保存</button></div></form></div>;
 }
 
-function CreationModal({ language = 'zh-CN', type, groups, wsl, terminalProfiles = {}, onClose, onCreate }) {
+function CreationModal({ language = 'zh-CN', type, groups, wsl, terminalProfiles = {}, initialCommand, onClose, onCreate }) {
   const isGroup = type === 'group';
   const isServer = type === 'server';
+  const isEditingCommand = !isGroup && !isServer && Boolean(initialCommand);
   const isZh = language === 'zh-CN';
   const groupOptions = groups.length ? groups.map((group) => ({ value: group.id, label: group.name })) : [{ value: 'local', label: 'Local services' }];
   const initialShell = 'wsl';
@@ -2125,7 +2206,14 @@ function CreationModal({ language = 'zh-CN', type, groups, wsl, terminalProfiles
     ? { name: '', note: '', accent: 'mint' }
     : isServer
       ? { name: '', label: '', groupId: groupOptions[0].value, port: '', dir: '', shell: initialShell }
-      : { name: '', command: '', description: '', scope: 'Current selection', tone: 'mint', executionMode: 'execute' });
+      : {
+        name: String(initialCommand?.name || ''),
+        command: String(initialCommand?.command || ''),
+        description: String(initialCommand?.description || ''),
+        scope: String(initialCommand?.scope || 'Current selection'),
+        tone: commandTones.has(initialCommand?.tone) ? initialCommand.tone : 'mint',
+        executionMode: initialCommand?.executionMode === 'paste' ? 'paste' : 'execute',
+      });
   const [pickingDirectory, setPickingDirectory] = useState(false);
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
   const pickDirectory = async () => {
@@ -2157,8 +2245,8 @@ function CreationModal({ language = 'zh-CN', type, groups, wsl, terminalProfiles
     shell: value,
     dir: '',
   }));
-  const title = isGroup ? (isZh ? '新建服务分组' : 'New service group') : isServer ? (isZh ? '新建终端' : 'New terminal') : (isZh ? '保存指令' : 'Save command');
-  const subtitle = isGroup ? (isZh ? '创建一个用于归类本地终端的分组。' : 'Create a group for related local terminals.') : isServer ? (isZh ? '选择终端类型和工作目录；目录留空时使用该终端的默认目录。' : 'Choose a terminal type and working directory, or leave it blank for the default.') : (isZh ? '保存可直接执行或粘贴后补充参数的指令。' : 'Save a command to execute or paste before adding parameters.');
+  const title = isGroup ? (isZh ? '新建服务分组' : 'New service group') : isServer ? (isZh ? '新建终端' : 'New terminal') : isEditingCommand ? (isZh ? '编辑指令' : 'Edit command') : (isZh ? '保存指令' : 'Save command');
+  const subtitle = isGroup ? (isZh ? '创建一个用于归类本地终端的分组。' : 'Create a group for related local terminals.') : isServer ? (isZh ? '选择终端类型和工作目录；目录留空时使用该终端的默认目录。' : 'Choose a terminal type and working directory, or leave it blank for the default.') : (isEditingCommand ? (isZh ? '修改指令内容、说明和发送方式。' : 'Update the command, description, and send mode.') : (isZh ? '保存可直接执行或粘贴后补充参数的指令。' : 'Save a command to execute or paste before adding parameters.'));
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <form className="creation-modal" onSubmit={submit}>
       <div className="modal-header"><div><div className="eyebrow">CONFIGURATION</div><h2>{title}</h2><p>{subtitle}</p></div><button type="button" className="icon-button" onClick={onClose}><X size={17} /></button></div>
@@ -2167,7 +2255,7 @@ function CreationModal({ language = 'zh-CN', type, groups, wsl, terminalProfiles
         {isServer && <><Field label={isZh ? '终端名称' : 'Terminal name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：开发终端' : 'Example: Development'} /><Field label={isZh ? '终端类型' : 'Terminal type'} required type="select" options={shellOptions} value={form.shell} onChange={changeShell} /><Field label={isZh ? '标签' : 'Label'} value={form.label} onChange={(value) => update('label', value)} placeholder={shellLabel(form.shell, language)} /><div className="field-row"><Field label={isZh ? '分组' : 'Group'} required type="select" options={groupOptions} value={form.groupId} onChange={(value) => update('groupId', value)} /><Field label={isZh ? '服务端口' : 'Service port'} value={form.port} onChange={(value) => update('port', value)} placeholder={isZh ? '可选' : 'Optional'} /></div><div className="field"><label>{isZh ? '工作目录' : 'Working directory'}</label><div className="directory-input"><input value={form.dir} onChange={(event) => update('dir', event.target.value)} placeholder={isWslShell ? (isZh ? '留空使用 /root' : 'Leave blank for /root') : (isZh ? '留空使用 Windows 用户目录' : 'Leave blank for the Windows user directory')} /><button type="button" className="icon-button compact" onClick={pickDirectory} disabled={pickingDirectory} title={isZh ? '选择工作目录' : 'Choose working directory'} aria-label={isZh ? '选择工作目录' : 'Choose working directory'}><FolderOpen size={15} /></button></div><span className="field-hint">{isWslShell ? (wsl?.available ? `${wsl.distro || 'Ubuntu'} ${isZh ? '已连接，默认目录为 /root' : 'connected; default directory is /root'}` : (isZh ? 'WSL 当前不可用，也可以手动输入目录' : 'WSL is unavailable; you can still enter a path manually')) : (isZh ? 'Windows Shell 直接在本机运行，不经过 Ubuntu' : 'Windows shells run locally without Ubuntu')}</span></div></>}
         {!isGroup && !isServer && <><Field label={isZh ? '指令名称' : 'Command name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：提升角色等级' : 'Example: Level up role'} /><Field label={isZh ? '终端指令' : 'Console command'} required mono value={form.command} onChange={(value) => update('command', value)} placeholder="gm level " /><div className="field"><label>{isZh ? '发送方式' : 'Send mode'}</label><div className="scope-options command-mode-options"><button type="button" className={form.executionMode === 'execute' ? 'selected' : ''} onClick={() => update('executionMode', 'execute')}><Play size={14} />{isZh ? '直接执行' : 'Execute'}</button><button type="button" className={form.executionMode === 'paste' ? 'selected' : ''} onClick={() => update('executionMode', 'paste')}><ClipboardPaste size={14} />{isZh ? '粘贴到终端' : 'Paste to terminal'}</button></div><span className="field-hint">{form.executionMode === 'paste' ? (isZh ? '不会发送回车，光标停在指令末尾。' : 'No Enter is sent; the cursor stays at the end.') : (isZh ? '发送后立即回车执行。' : 'Sends Enter and runs immediately.')}</span></div><Field label={isZh ? '说明' : 'Description'} value={form.description} onChange={(value) => update('description', value)} placeholder={isZh ? '这条指令的用途' : 'What does this command do?'} /><div className="field"><label>{isZh ? '适用范围' : 'Scope'}</label><div className="scope-options">{['Current selection', 'All services', 'Single service'].map((scope) => <button type="button" key={scope} className={form.scope === scope ? 'selected' : ''} onClick={() => update('scope', scope)}>{scope}</button>)}</div></div></>}
       </div>
-      <div className="modal-footer"><button type="button" className="button secondary" onClick={onClose}>{isZh ? '取消' : 'Cancel'}</button><button className="button primary" type="submit"><Check size={15} />{isZh ? '保存' : 'Save'}</button></div>
+      <div className="modal-footer"><button type="button" className="button secondary" onClick={onClose}>{isZh ? '取消' : 'Cancel'}</button><button className="button primary" type="submit"><Check size={15} />{isEditingCommand ? (isZh ? '保存修改' : 'Save changes') : (isZh ? '保存' : 'Save')}</button></div>
     </form>
   </div>;
 }

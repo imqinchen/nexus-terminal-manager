@@ -375,16 +375,40 @@ function runGuest(program, args, options = {}) {
   });
 }
 
+function decodeWindowsOutput(value) {
+  if (!Buffer.isBuffer(value)) return String(value || '');
+  if (!value.length) return '';
+  const utf8 = value.toString('utf8');
+  if (!utf8.includes('\uFFFD')) return utf8;
+  try { return new TextDecoder('gb18030').decode(value); } catch { return utf8; }
+}
+
+function commandErrorDetail(error) {
+  const output = [error?.stdout, error?.stderr]
+    .map(decodeWindowsOutput)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .join('\n');
+  return output || error?.message || 'unknown process error';
+}
+
 function runHost(program, args, options = {}) {
   return new Promise((resolve, reject) => {
-    execFile(program, args, { timeout: options.timeout || 10000, windowsHide: true, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(program, args, {
+      timeout: options.timeout || 10000,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+      encoding: 'buffer',
+    }, (error, stdout, stderr) => {
+      const decodedStdout = decodeWindowsOutput(stdout);
+      const decodedStderr = decodeWindowsOutput(stderr);
       if (error) {
-        error.stdout = stdout;
-        error.stderr = stderr;
+        error.stdout = decodedStdout;
+        error.stderr = decodedStderr;
         reject(error);
         return;
       }
-      resolve({ stdout, stderr });
+      resolve({ stdout: decodedStdout, stderr: decodedStderr });
     });
   });
 }
@@ -637,9 +661,167 @@ async function portListeners(port) {
   return process.platform === 'win32' ? windowsPortListeners(port) : wsl1PortListeners(port);
 }
 
-async function signalPortListeners(port, signal) {
+async function guestProcessSnapshot() {
+  try {
+    // Reading every /proc cwd/cmdline entry is surprisingly slow on WSL1.
+    // ps gives us the complete process tree in one call; service identities
+    // in the command line are enough to identify the configured service.
+    const { stdout } = await runGuest('ps', ['-eo', 'pid=,ppid=,comm=,args='], { timeout: 5000 });
+    return String(stdout || '').split(/\r?\n/).map((line) => {
+      const columns = line.split('\t');
+      if (columns.length >= 4) {
+        const pid = Number(columns[0]);
+        const ppid = Number(columns[1]);
+        if (!Number.isInteger(pid) || pid <= 1) return null;
+        return { pid, ppid: Number.isInteger(ppid) ? ppid : 0, cwd: columns[2] || '', args: columns.slice(3).join('\t') || '' };
+      }
+      const fields = line.trim().split(/\s+/);
+      const pid = Number(fields[0]);
+      const ppid = Number(fields[1]);
+      if (!Number.isInteger(pid) || pid <= 1 || !Number.isInteger(ppid)) return null;
+      return { pid, ppid, cwd: '', args: fields.slice(2).join(' ') };
+    }).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function compactGuestIdentity(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function guestIdentityCompounds(value) {
+  const parts = String(value || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const compounds = new Set(parts);
+  for (let start = 0; start < parts.length; start += 1) {
+    let compound = '';
+    for (let end = start; end < Math.min(parts.length, start + 4); end += 1) {
+      compound += parts[end];
+      compounds.add(compound);
+    }
+  }
+  return compounds;
+}
+
+function guestPath(value) {
+  const normalized = String(value || '').replace(/\\/g, '/').replace(/\/+/g, '/');
+  if (!normalized || normalized === '/') return '/';
+  return normalized.replace(/\/$/, '');
+}
+
+function processIsUnderGuestPath(processInfo, root) {
+  const cwd = guestPath(processInfo.cwd);
+  const base = guestPath(root);
+  return cwd === base || cwd.startsWith(`${base}/`);
+}
+
+function serverProcessIdentities(server) {
+  // Prefer human-readable service names/session names. The short id alone
+  // is too weak when `ps` cannot expose a process cwd on WSL1.
+  return [server.name, server.label, server.session]
+    .map(compactGuestIdentity)
+    .filter((value) => value.length >= 4);
+}
+
+function processArgumentsMatchServer(processInfo, server) {
+  const identities = serverProcessIdentities(server);
+  if (!identities.length) return false;
+  const compounds = guestIdentityCompounds(processInfo.args);
+  return identities.some((identity) => [...compounds].some((compound) => compound === identity || compound.endsWith(identity)));
+}
+
+function processMatchesServer(processInfo, server) {
+  if (/(?:^|\s)tmux(?::\s*server)?(?:\s|$)/i.test(String(processInfo.args || ''))) return false;
+  if (processInfo.cwd) {
+    if (!processIsUnderGuestPath(processInfo, guestCwd(server))) return false;
+  } else if (!/(?:^|\s)(?:screen|SCREEN|beam\.smp|erl|start\.sh)(?:\s|$)/i.test(String(processInfo.args || ''))) {
+    // WSL1's ps output has no cwd column. Without a runtime marker, a short
+    // configured name could accidentally match an unrelated process.
+    return false;
+  }
+  const identities = serverProcessIdentities(server);
+  const compounds = new Set([...guestIdentityCompounds(processInfo.args), ...guestIdentityCompounds(processInfo.cwd)]);
+  return identities.some((identity) => [...compounds].some((compound) => compound === identity || compound.endsWith(identity)));
+}
+
+async function tmuxPanePids(session) {
+  if (!session || !hasTmux()) return [];
+  try {
+    // wsl.exe treats an unescaped `#` as the start of a shell comment while
+    // reconstructing direct command arguments. The leading backslash is
+    // removed by that outer parser before tmux receives its format string.
+    const { stdout } = await runGuest('tmux', ['list-panes', '-t', `${session}:`, '-F', '\\#{pane_pid}'], { timeout: 5000 });
+    return [...new Set(String(stdout || '').match(/\d+/g)?.map(Number).filter((pid) => Number.isInteger(pid) && pid > 1) || [])];
+  } catch {
+    return [];
+  }
+}
+
+function processTreeIds(processes, roots) {
+  const children = new Map();
+  processes.forEach((processInfo) => {
+    if (!children.has(processInfo.ppid)) children.set(processInfo.ppid, []);
+    children.get(processInfo.ppid).push(processInfo.pid);
+  });
+  const ids = new Set();
+  const visit = (pid) => {
+    if (ids.has(pid)) return;
+    ids.add(pid);
+    (children.get(pid) || []).forEach(visit);
+  };
+  roots.forEach(visit);
+  return [...ids];
+}
+
+function screenSessionName(processInfo) {
+  const match = String(processInfo.args || '').match(/\s-dmSL\s+(\S+)/i);
+  return match?.[1] || '';
+}
+
+async function sendScreenStopCommand(server, processes) {
+  const stopCommand = String(server.stopCommand || '').trim();
+  if (!stopCommand) return;
+  const sessions = [...new Set(processes
+    .filter((processInfo) => /(?:^|\s)(?:screen|SCREEN)(?:\s|$)/.test(processInfo.args))
+    .filter((processInfo) => processMatchesServer(processInfo, server) || processArgumentsMatchServer(processInfo, server))
+    .map(screenSessionName)
+    .filter(Boolean))];
+  await Promise.allSettled(sessions.map((session) => runGuest('screen', ['-S', session, '-X', 'stuff', `${stopCommand}\r`], { timeout: 8000 })));
+}
+
+async function matchingWslProcessIds(server) {
+  if (process.platform !== 'win32' || server?.shell !== 'wsl') return { processes: [], ids: [] };
+  const processes = await guestProcessSnapshot();
+  const matching = processes.filter((processInfo) => processMatchesServer(processInfo, server));
+  const panePids = await tmuxPanePids(server.session || `nexus-${safeId(server.id)}`);
+  const treeRoots = [...new Set([...panePids, ...matching.map((processInfo) => processInfo.pid)])];
+  const ids = processTreeIds(processes, treeRoots).filter((pid) => pid > 1);
+  return { processes, ids };
+}
+
+async function signalMatchingWslProcesses(server, signal) {
+  const found = await matchingWslProcessIds(server);
+  return signalGuestProcessIds(server, found.ids, signal);
+}
+
+async function signalGuestProcessIds(server, ids, signal) {
+  if (!Array.isArray(ids) || !ids.length) return { ids: [], failed: [] };
+  const results = await Promise.allSettled(ids.map((pid) => runGuest('kill', [`-${signal}`, String(pid)], { timeout: 6000 })));
+  const failed = results.filter((result) => result.status === 'rejected');
+  if (failed.length) {
+    console.warn(`[delete] ${signal} failed for WSL ${server.id}: ${failed.map((result) => commandErrorDetail(result.reason)).join(' | ')}`);
+  }
+  return { ids, failed };
+}
+
+async function signalPortListeners(port, signal, server) {
   const listeners = await portListeners(port);
+  if (!listeners.length) return { listeners: [], failed: [], remaining: false };
   const results = await Promise.allSettled(listeners.map((listener) => {
+    // WSL1 exposes Linux listeners to Windows netstat with a Windows PID,
+    // but taskkill cannot terminate that process. The WSL process tree is
+    // handled separately by signalMatchingWslProcesses.
+    if (server?.shell === 'wsl' && listener.source === 'windows') return Promise.resolve();
     if (listener.source === 'windows') {
       const args = ['/PID', String(listener.pid), '/T'];
       if (signal === 'KILL') args.push('/F');
@@ -653,10 +835,12 @@ async function signalPortListeners(port, signal) {
     }
     return runGuest('kill', [`-${signal}`, String(listener.pid)], { timeout: 6000 });
   }));
-  const failed = results.find((result) => result.status === 'rejected');
-  if (failed && await isPortListening(port)) {
-    throw failed.reason;
+  const failed = results.filter((result) => result.status === 'rejected');
+  if (failed.length) {
+    const details = failed.map((result) => commandErrorDetail(result.reason)).join(' | ');
+    console.warn(`[ports] ${signal} failed for ${port}: ${details}`);
   }
+  return { listeners, failed, remaining: await isPortListening(port) };
 }
 
 async function stopAndRemoveServer(serverId) {
@@ -665,12 +849,24 @@ async function stopAndRemoveServer(serverId) {
   const session = server.session || `nexus-${safeId(server.id)}`;
   const port = configuredPort(server);
   if (port === PORT) throw new Error(`configured port ${port} belongs to the Nexus backend; correct the terminal port before deleting`);
+  // Capture the initial state so a service that is already stopped does not
+  // incur the graceful-stop delays below. The value is also returned to the
+  // UI as an accurate account of what the delete operation found.
+  const portWasListening = port ? await isPortListening(port) : false;
+  const waitForConfiguredPort = (timeoutMs) => portWasListening
+    ? waitForPortRelease(port, timeoutMs)
+    : Promise.resolve(true);
   const connection = activeTerminalConnections.get(serverId);
   const nativeState = nativeTerminals.get(serverId);
+  // Capture WSL process roots before killing the tmux session. A service can
+  // outlive its tmux pane, especially on WSL1 where Windows cannot taskkill
+  // the Linux PID reported by netstat.
+  const wslStopContext = server.shell === 'wsl' ? await matchingWslProcessIds(server) : null;
+  if (wslStopContext?.processes?.length) await sendScreenStopCommand(server, wslStopContext.processes);
   if (nativeState && isNativeShell(server)) {
     try {
       nativeState.terminal.child.write(server.stopCommand ? `${server.stopCommand}\r` : '\u0003');
-      await delay(750);
+      await waitForConfiguredPort(750);
     } catch (error) {
       console.error(`[delete] native shell stop failed for ${serverId}: ${error.message}`);
     }
@@ -684,23 +880,38 @@ async function stopAndRemoveServer(serverId) {
     try {
       if (server.stopCommand) await runGuest('tmux', ['send-keys', '-t', session, server.stopCommand, 'Enter'], { timeout: 8000 });
       else await runGuest('tmux', ['send-keys', '-t', session, 'C-c'], { timeout: 8000 });
-      await delay(1500);
+      await waitForConfiguredPort(1500);
     } catch (error) {
       console.error(`[delete] graceful stop failed for ${serverId}: ${error.message}`);
     }
     if (await tmuxSessionExists(session)) await runGuest('tmux', ['kill-session', '-t', session], { timeout: 8000 });
   }
 
-  let portWasListening = await isPortListening(port);
+  if (wslStopContext?.ids?.length) await signalGuestProcessIds(server, wslStopContext.ids, 'TERM');
+  if (server.shell === 'wsl') {
+    await waitForConfiguredPort(750);
+    // Re-scan after the graceful stop so children spawned by a wrapper are
+    // included before the force-kill pass.
+    await signalMatchingWslProcesses(server, 'TERM');
+    await waitForConfiguredPort(1000);
+    await signalMatchingWslProcesses(server, 'KILL');
+  }
+
   if (portWasListening) {
-    await signalPortListeners(port, 'TERM');
-    await delay(1000);
+    // A service can outlive its wrapper. Always continue to the force-kill
+    // pass when the configured port is still occupied.
+    await signalPortListeners(port, 'TERM', server);
+    await waitForConfiguredPort(1000);
     if (await isPortListening(port)) {
-      await signalPortListeners(port, 'KILL');
-      await delay(500);
+      await signalPortListeners(port, 'KILL', server);
+      await waitForConfiguredPort(500);
     }
   }
-  if (await isPortListening(port)) throw new Error(`port ${port} is still listening; terminal configuration was not deleted`);
+  if (await isPortListening(port)) {
+    const remaining = await portListeners(port);
+    const owners = remaining.map((listener) => `${listener.source}:${listener.pid}`).join(', ');
+    throw new Error(`端口 ${port} 仍被进程占用${owners ? `（${owners}）` : ''}，已保留终端配置。请先停止占用该端口的外部服务后再删除。`);
+  }
 
   const nextGroups = config.groups.map((group) => ({
     ...group,
@@ -769,6 +980,17 @@ function spawnTerminal(serverId) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+async function waitForPortRelease(port, timeoutMs = 1800, intervalMs = 120) {
+  if (!port) return true;
+  const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+  do {
+    if (!(await isPortListening(port))) return true;
+    if (Date.now() >= deadline) return false;
+    await delay(intervalMs);
+  } while (Date.now() < deadline);
+  return !(await isPortListening(port));
 }
 
 function withTimeout(promise, timeoutMs, label) {

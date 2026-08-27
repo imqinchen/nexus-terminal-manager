@@ -340,6 +340,11 @@ ipcMain.handle('open-help-document', async () => {
   const outputPath = path.join(outputDirectory, 'Nexus Control 帮助与文档.md');
   fs.mkdirSync(outputDirectory, { recursive: true });
   fs.writeFileSync(outputPath, fs.readFileSync(sourcePath));
+  const sourceAssets = path.join(__dirname, '..', 'docs', 'assets');
+  const outputAssets = path.join(outputDirectory, 'assets');
+  if (fs.existsSync(sourceAssets)) {
+    fs.cpSync(sourceAssets, outputAssets, { recursive: true });
+  }
   const error = await shell.openPath(outputPath);
   return { ok: !error, path: outputPath, error: error || undefined };
 });
