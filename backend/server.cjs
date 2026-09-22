@@ -21,6 +21,10 @@ const { detectWslDistro } = require('./wsl-config.cjs');
 
 const PORT = Number(process.env.NEXUS_PTY_PORT || 4317);
 const HOST = process.env.NEXUS_PTY_HOST || '127.0.0.1';
+// Bump this when the PTY wire behavior changes. Electron uses it to avoid
+// silently reusing an older manually-started backend that still renders the
+// legacy connection banner.
+const BACKEND_RUNTIME_VERSION = 16;
 // The project configuration is intentionally fixed. WSL/Ubuntu discovery is
 // handled separately by wsl-config.cjs and is never stored in server.json.
 const CONFIG_PATH = process.env.NEXUS_CONFIG_PATH || path.join(__dirname, 'servers.json');
@@ -34,7 +38,32 @@ const nativeTerminals = new Map();
 // Keep the WSL PTY alive while the user switches between terminal tabs. The
 // browser WebSocket is only a view onto this process and can be rebound quickly.
 const wslTerminals = new Map();
-const NATIVE_REPLAY_LIMIT = 512 * 1024;
+const TMUX_HISTORY_LIMIT = 10000;
+// Renderer tabs are recreated when the user switches sessions. Restore a
+// useful amount of tmux history into the new xterm buffer so the scrollbar
+// does not collapse to the visible pane after every switch.
+const TMUX_RESTORE_HISTORY_LINES = Math.max(
+  100,
+  Number(process.env.NEXUS_RESTORE_HISTORY_LINES) || 1000,
+);
+// Keep managed sessions in the normal terminal buffer so xterm can expose
+// tmux history through mouse-wheel and scrollbar navigation.
+const TMUX_ALTERNATE_SCREEN = 'off';
+// Nexus renders its own connection/session chrome. Keeping tmux's status bar
+// disabled avoids a second repaint of the bottom row after a screen restore.
+const TMUX_STATUS = 'off';
+// These bounds remain as a guard for an in-flight renderer rebind. Fresh
+// attachments use the already-buffered tmux repaint immediately and do not
+// wait for this synchronization window.
+const TMUX_SCREEN_SYNC_MAX_DELAY = Math.max(500, Number(process.env.NEXUS_SCREEN_SYNC_MAX_DELAY) || 1000);
+const TMUX_SCREEN_SYNC_MIN_DELAY = Math.min(
+  TMUX_SCREEN_SYNC_MAX_DELAY,
+  Math.max(300, Number(process.env.NEXUS_SCREEN_SYNC_MIN_DELAY) || 500),
+);
+const TMUX_SCREEN_SYNC_QUIET_DELAY = Math.max(120, Number(process.env.NEXUS_SCREEN_SYNC_QUIET_DELAY) || 180);
+const TMUX_INITIAL_DISPLAY_TIME = 100;
+const TMUX_INITIAL_BUFFER_LIMIT = 2 * 1024 * 1024;
+const TMUX_INITIAL_INPUT_LIMIT = 256 * 1024;
 const CAPABILITY_CACHE_TTL = 30000;
 const capabilityCache = { tmux: null, tmuxCheckedAt: 0, wsl: null, wslCheckedAt: 0 };
 let capabilityRefreshPromise = null;
@@ -158,6 +187,11 @@ function loadConfig() {
 
 let config = loadConfig();
 let configFileStamp = getConfigFileStamp();
+// `mtime:size` is useful for noticing an external edit, but it is not an
+// ordering guarantee: two rapid writes can share a timestamp on some file
+// systems.  Keep an in-process monotonic revision as well so renderer polls
+// can reliably reject a response that was made before a newer save/delete.
+let configRevision = 1;
 
 function getConfigFileStamp() {
   try {
@@ -178,6 +212,7 @@ function reloadConfigFromDisk() {
   const nextConfig = readConfigFromDisk();
   config = nextConfig;
   configFileStamp = nextStamp;
+  configRevision += 1;
   return clone(config);
 }
 
@@ -217,6 +252,7 @@ function saveConfig(nextConfig) {
   }
   config = normalized;
   configFileStamp = getConfigFileStamp();
+  configRevision += 1;
   return clone(config);
 }
 
@@ -363,7 +399,11 @@ function runGuest(program, args, options = {}) {
     ? ['-d', WSL_CONFIG.distro || 'Ubuntu', '--', program, ...args]
     : args;
   return new Promise((resolve, reject) => {
-    execFile(command, commandArgs, { timeout: options.timeout || 10000, windowsHide: true, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+    execFile(command, commandArgs, {
+      timeout: options.timeout || 10000,
+      windowsHide: true,
+      maxBuffer: options.maxBuffer || 1024 * 1024,
+    }, (error, stdout, stderr) => {
       if (error) {
         error.stdout = stdout;
         error.stderr = stderr;
@@ -446,6 +486,10 @@ async function ensureTmuxSession(server) {
   const session = server.session || `nexus-${safeId(server.id)}`;
   fs.mkdirSync(LOG_DIR, { recursive: true });
   if (!(await tmuxSessionExists(session))) await runGuest('tmux', ['new-session', '-d', '-s', session, '-c', guestCwd(server)], { timeout: 8000 });
+  await runGuest('tmux', ['set-option', '-t', session, 'history-limit', String(TMUX_HISTORY_LIMIT)], { timeout: 4000 });
+  await runGuest('tmux', ['set-option', '-t', session, 'display-time', String(TMUX_INITIAL_DISPLAY_TIME)], { timeout: 4000 });
+  await runGuest('tmux', ['set-option', '-t', session, 'status', TMUX_STATUS], { timeout: 4000 });
+  await runGuest('tmux', ['set-window-option', '-t', session, 'alternate-screen', TMUX_ALTERNATE_SCREEN], { timeout: 4000 });
   await runGuest('tmux', ['set-window-option', '-t', session, 'aggressive-resize', 'on'], { timeout: 4000 });
   await enableTmuxLogging(server);
   return true;
@@ -456,6 +500,10 @@ async function enableLoggingForExistingSessions() {
   const results = await Promise.allSettled(allServers().filter((server) => server.shell === 'wsl' && server.tmux !== false).map(async (server) => {
     const session = server.session || `nexus-${safeId(server.id)}`;
     if (!(await tmuxSessionExists(session))) return;
+    await runGuest('tmux', ['set-option', '-t', session, 'history-limit', String(TMUX_HISTORY_LIMIT)], { timeout: 4000 });
+    await runGuest('tmux', ['set-option', '-t', session, 'display-time', String(TMUX_INITIAL_DISPLAY_TIME)], { timeout: 4000 });
+    await runGuest('tmux', ['set-option', '-t', session, 'status', TMUX_STATUS], { timeout: 4000 });
+    await runGuest('tmux', ['set-window-option', '-t', session, 'alternate-screen', TMUX_ALTERNATE_SCREEN], { timeout: 4000 });
     await backfillTmuxHistory(server);
     await enableTmuxLogging(server);
   }));
@@ -478,12 +526,371 @@ function writeToOpenSocket(webSocket, payload) {
   if (webSocket?.readyState === WebSocket.OPEN) webSocket.send(JSON.stringify(payload));
 }
 
-function createNativeTerminal(serverId) {
-  const terminal = spawnTerminal(serverId);
+function sendInitialTmuxReset(state, webSocket, reason = 'fresh-attachment') {
+  if (!state || !webSocket || state.initialResetSocket === webSocket) return;
+  writeToOpenSocket(webSocket, { type: 'reset', reason });
+  state.initialResetSocket = webSocket;
+}
+
+function clearInitialTmuxTimers(state) {
+  if (!state) return;
+  if (state.initialResetTimer) clearTimeout(state.initialResetTimer);
+  if (state.initialMarkerTimer) clearTimeout(state.initialMarkerTimer);
+  if (state.initialFallbackTimer) clearTimeout(state.initialFallbackTimer);
+  state.initialResetTimer = null;
+  state.initialMarkerTimer = null;
+  state.initialFallbackTimer = null;
+}
+
+async function captureTmuxSnapshot(state, timeout = 4000, includeScrollback = false) {
+  const session = state?.terminal?.session;
+  if (!session) return '';
+  try {
+    // Fresh attachments use the visible pane only. A renderer rebind (tab
+    // switch/reconnect) asks for recent history as well, because its previous
+    // xterm instance and local scrollback were disposed by React.
+    const captureArgs = ['capture-pane', '-e', '-p'];
+    if (includeScrollback) captureArgs.push('-S', `-${TMUX_RESTORE_HISTORY_LINES}`);
+    captureArgs.push('-t', session);
+    const cursorFormat = process.platform === 'win32'
+      ? '\\#{cursor_x}:\\#{cursor_y}'
+      : '#{cursor_x}:#{cursor_y}';
+    const [paneResult, cursorResult] = await Promise.all([
+      runGuest('tmux', captureArgs, { timeout, maxBuffer: 8 * 1024 * 1024 }),
+      runGuest('tmux', ['display-message', '-p', '-t', session, cursorFormat], { timeout }),
+    ]);
+    const pane = String(paneResult.stdout || '');
+    if (!pane) return '';
+    const cursor = String(cursorResult.stdout || '').trim().match(/^(\d+):(\d+)$/);
+    if (!cursor) return pane;
+    const column = Math.max(1, Number(cursor[1]) + 1);
+    const row = Math.max(1, Number(cursor[2]) + 1);
+    return `\x1b[?25l\x1b[H${pane}\x1b[${row};${column}H\x1b[?25h`;
+  } catch (error) {
+    if (process.env.NEXUS_DEBUG_PTY) console.warn(`[pty] unable to capture tmux snapshot ${state.serverId || ''}: ${error.message}`);
+    return '';
+  }
+}
+
+async function refreshTmuxSnapshotCache(state) {
+  if (!state?.terminal?.useTmux || state.disposed || !state.initialResetDone) return;
+  const captureGeneration = (state.snapshotCaptureGeneration || 0) + 1;
+  const outputRevision = state.outputRevision || 0;
+  state.snapshotCaptureGeneration = captureGeneration;
+  const snapshot = await captureTmuxSnapshot(state, 1500, true);
+  if (
+    !snapshot
+    || state.disposed
+    || state.snapshotCaptureGeneration !== captureGeneration
+    || state.outputRevision !== outputRevision
+  ) return;
+  state.snapshotCache = snapshot;
+  state.snapshotRevision = outputRevision;
+}
+
+function completeTmuxRendererRebind(state, webSocket, syncGeneration, snapshot) {
+  if (
+    !state
+    || state.disposed
+    || state.initialSyncGeneration !== syncGeneration
+    || state.webSocket !== webSocket
+  ) return false;
+  clearInitialTmuxTimers(state);
+  const bufferedOutput = String(state.initialTmuxBuffer || '');
+  state.initialTmuxBuffer = '';
+  state.initialResetDone = true;
+  state.initialResetStartedAt = 0;
+  state.initialResetFinishing = false;
+  sendInitialTmuxReset(state, webSocket, 'renderer-rebind');
+  if (snapshot) writeToOpenSocket(webSocket, { type: 'output', data: snapshot, snapshot: true });
+  // Output produced while capture-pane was in flight must not be lost. It can
+  // overlap the very end of a busy snapshot, but preserving live output is
+  // preferable to silently dropping a service message.
+  if (bufferedOutput) writeToOpenSocket(webSocket, { type: 'output', data: bufferedOutput });
+  const pendingInput = state.initialInputBuffer || '';
+  state.initialInputBuffer = '';
+  if (pendingInput && state.terminal?.child) {
+    setImmediate(() => {
+      if (!state.disposed && state.webSocket === webSocket) {
+        try { state.terminal.child.write(pendingInput); } catch { /* PTY exited */ }
+      }
+    });
+  }
+  if (snapshot && !bufferedOutput) {
+    state.snapshotCache = snapshot;
+    state.snapshotRevision = state.outputRevision || 0;
+  }
+  return true;
+}
+
+async function restoreTmuxRendererFromSnapshot(state, webSocket, syncGeneration, cachedSnapshot = '') {
+  let snapshot = cachedSnapshot;
+  if (!snapshot) snapshot = await captureTmuxSnapshot(state, 1200, true);
+  completeTmuxRendererRebind(state, webSocket, syncGeneration, snapshot);
+}
+
+async function finishInitialTmuxAttachment(state) {
+  if (!state || state.initialResetDone || state.initialResetFinishing) return;
+  const syncGeneration = state.initialSyncGeneration;
+  const reason = state.initialResetReason || 'fresh-attachment';
+  const restoreSnapshot = reason !== 'fresh-attachment';
+  state.initialResetFinishing = true;
+  if (process.env.NEXUS_DEBUG_PTY) console.log(`[pty] initial attachment finished ${state.serverId || state.terminal?.serverId || ''}`);
+  clearInitialTmuxTimers(state);
+  // Fresh attachments now stream their first PTY repaint immediately. This
+  // delayed path is retained only for a renderer rebind that needs a
+  // capture-pane replacement while the shared PTY is still attached.
+  let snapshot = restoreSnapshot ? String(state.initialTmuxBuffer || '') : '';
+  if (!restoreSnapshot) state.initialTmuxBuffer = '';
+  // Some tmux/ConPTY combinations do not emit the repaint through node-pty.
+  // Read the visible pane directly in that case so a tab switch still has a
+  // useful screen instead of only the renderer's local prompt.
+  if (restoreSnapshot && !snapshot) snapshot = await captureTmuxSnapshot(state, 4000, true);
+  // A new rebind can start while the fallback capture is in flight. Do not let
+  // the old capture reset or paint over the newer renderer connection.
+  if (state.initialSyncGeneration !== syncGeneration || state.disposed) {
+    if (state.initialSyncGeneration === syncGeneration) state.initialResetFinishing = false;
+    return;
+  }
+  // Prefer any PTY repaint that arrived while the fallback command was being
+  // queried; it includes cursor placement and terminal control sequences.
+  if (restoreSnapshot && state.initialTmuxBuffer) snapshot = String(state.initialTmuxBuffer);
+  state.initialTmuxBuffer = '';
+  state.initialResetDone = true;
+  state.initialResetStartedAt = 0;
+  if (state.disposed) {
+    state.initialResetFinishing = false;
+    return;
+  }
+  // node-pty uses ConPTY on Windows.  Clearing xterm in the renderer without
+  // clearing ConPTY's own screen cache lets Windows replay the attach paint a
+  // moment later (usually after the reset packet), which looks like a delayed
+  // "PTY ready"/tmux snapshot.  Keep the PTY process and tmux session alive;
+  // this only drops the stale renderer-side screen state.
+  try { state.terminal.child.clear?.(); } catch { /* PTY may have exited */ }
+  // Reset only after every quarantined repaint has drained. The renderer
+  // already shows a local prompt while this short synchronization completes.
+  sendInitialTmuxReset(state, state.webSocket, reason);
+  if (restoreSnapshot && snapshot) {
+    // The renderer resets once more before writing a same-process snapshot, so
+    // the local prompt drawn during the handshake is replaced by the real pane.
+    writeToOpenSocket(state.webSocket, { type: 'output', data: snapshot, snapshot: true });
+  }
+  const pendingInput = state.initialInputBuffer || '';
+  state.initialInputBuffer = '';
+  if (pendingInput && state.terminal?.child) {
+    // The reset packet is queued before the command bytes, so the renderer is
+    // clean and ready by the time the real shell echo/output arrives.
+    setImmediate(() => {
+      if (!state.disposed) {
+        try { state.terminal.child.write(pendingInput); } catch { /* PTY exited */ }
+      }
+    });
+  }
+  state.initialResetFinishing = false;
+}
+
+function triggerInitialTmuxProbe(state) {
+  if (!state || state.initialProbeSent || !state.terminal?.child) return false;
+  state.initialProbeSent = true;
+  // Resizing to the current dimensions is harmless to the attached shell, but
+  // makes tmux 2.x flush any screen repaint it kept pending behind ConPTY.
+  try {
+    state.terminal.child.resize(Math.max(20, state.cols || 120), Math.max(5, state.rows || 32));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function scheduleInitialTmuxQuiet(state) {
+  if (!state || state.initialResetDone) return;
+  if (state.initialMarkerTimer) clearTimeout(state.initialMarkerTimer);
+  state.initialMarkerTimer = setTimeout(() => {
+    state.initialMarkerTimer = null;
+    advanceInitialTmuxSync(state);
+  }, TMUX_SCREEN_SYNC_QUIET_DELAY);
+  state.initialMarkerTimer.unref?.();
+}
+
+function advanceInitialTmuxSync(state) {
+  if (!state || state.initialResetDone || state.initialResetFinishing || state.disposed) return;
+  // Trigger one controlled repaint before declaring the renderer ready.
+  // Keystrokes received during the sync remain queued until after reset, so
+  // their real shell echo and command output remain visible to the user.
+  const probed = triggerInitialTmuxProbe(state);
+  if (probed) {
+    scheduleInitialTmuxQuiet(state);
+    return;
+  }
+  const elapsed = Date.now() - (state.initialResetStartedAt || Date.now());
+  const minimumDelay = Math.min(
+    Math.max(300, Number(state.initialResetMaxDelay) || TMUX_SCREEN_SYNC_MAX_DELAY),
+    Math.max(300, Number(state.initialResetMinDelay) || TMUX_SCREEN_SYNC_MIN_DELAY),
+  );
+  if (elapsed < minimumDelay) {
+    if (state.initialMarkerTimer) clearTimeout(state.initialMarkerTimer);
+    state.initialMarkerTimer = setTimeout(() => {
+      state.initialMarkerTimer = null;
+      advanceInitialTmuxSync(state);
+    }, minimumDelay - elapsed);
+    state.initialMarkerTimer.unref?.();
+    return;
+  }
+  const syncGeneration = state.initialSyncGeneration;
+  void finishInitialTmuxAttachment(state).catch((error) => {
+    if (process.env.NEXUS_DEBUG_PTY) console.warn(`[pty] initial tmux sync failed ${state.serverId || ''}: ${error.message}`);
+    if (state.initialSyncGeneration === syncGeneration) state.initialResetFinishing = false;
+  });
+}
+
+function scheduleInitialTmuxReset(state, webSocket) {
+  if (!state?.terminal?.useTmux || state.initialResetDone || !webSocket) return;
+  if (!state.initialResetStartedAt) state.initialResetStartedAt = Date.now();
+  // The PTY is shared by reconnecting renderer sockets. Do not restart the
+  // hard deadline every time a tab is rebound, otherwise a slow/unstable
+  // client can keep the initial screen quarantined indefinitely.
+  if (state.initialResetTimer) return;
+  const elapsed = Date.now() - state.initialResetStartedAt;
+  const maxDelay = Math.max(500, Number(state.initialResetMaxDelay) || TMUX_SCREEN_SYNC_MAX_DELAY);
+  const remaining = Math.max(0, maxDelay - elapsed);
+  state.initialResetTimer = setTimeout(() => {
+    state.initialResetTimer = null;
+    // A tmux build without a recognizable marker still gets a bounded
+    // fallback. Give the pending probe/input one final quiet cycle before
+    // releasing the renderer; this prevents a late repaint from leaking out
+    // immediately after the hard deadline.
+    advanceInitialTmuxSync(state);
+  }, remaining);
+  state.initialResetTimer.unref?.();
+}
+
+function beginInitialTmuxAttachment(state, webSocket) {
+  if (!state?.terminal?.useTmux || state.initialResetDone || !webSocket) return;
+  if (process.env.NEXUS_DEBUG_PTY) console.log(`[pty] restoring tmux screen ${state.serverId || ''}`);
+  // A newly-created PTY already contains tmux's repaint in initialTmuxBuffer.
+  // Release it immediately instead of quarantining it behind a quiet-period
+  // timer. This keeps reconnects as quick as the old direct-stream behavior.
+  clearInitialTmuxTimers(state);
+  state.initialSyncGeneration += 1;
+  state.initialResetFinishing = false;
+  state.initialResetStartedAt = 0;
+  state.initialResetDone = true;
+  const syncGeneration = state.initialSyncGeneration;
+  const bufferedOutput = String(state.initialTmuxBuffer || '');
+  state.initialTmuxBuffer = '';
+  if (bufferedOutput) {
+    // This is the actual PTY stream. Keep it as ordinary output so the
+    // renderer never clears a retained canvas merely because the first chunk
+    // happened to arrive before the WebSocket callback.
+    writeToOpenSocket(webSocket, { type: 'output', data: bufferedOutput });
+  } else {
+    // The PTY can win the race and attach before node-pty emits its first
+    // repaint. Read the pane directly, but never overwrite live output that
+    // arrived while capture-pane was running.
+    const revision = state.outputRevision || 0;
+    // Only show the compatibility prompt when tmux produced no repaint at
+    // all. Any PTY byte cancels this path, so a retained screen is never
+    // cleared just because capture-pane is slow.
+    state.initialFallbackTimer = setTimeout(() => {
+      state.initialFallbackTimer = null;
+      if (
+        !state.disposed
+        && state.webSocket === webSocket
+        && state.initialSyncGeneration === syncGeneration
+        && state.outputRevision === revision
+      ) writeToOpenSocket(webSocket, { type: 'reset', reason: 'fresh-attachment' });
+    }, 900);
+    state.initialFallbackTimer.unref?.();
+    void captureTmuxSnapshot(state, 1200).then((snapshot) => {
+      if (
+        !snapshot
+        || state.disposed
+        || state.webSocket !== webSocket
+        || state.initialSyncGeneration !== syncGeneration
+        || state.outputRevision !== revision
+      ) return;
+      if (state.initialFallbackTimer) clearTimeout(state.initialFallbackTimer);
+      state.initialFallbackTimer = null;
+      writeToOpenSocket(webSocket, { type: 'output', data: snapshot, snapshot: true });
+      state.snapshotCache = snapshot;
+      state.snapshotRevision = state.outputRevision || 0;
+    }).catch(() => { /* the live PTY remains usable without a snapshot */ });
+  }
+  const pendingInput = state.initialInputBuffer || '';
+  state.initialInputBuffer = '';
+  if (pendingInput && state.terminal?.child) {
+    setImmediate(() => {
+      if (!state.disposed && state.webSocket === webSocket) {
+        try { state.terminal.child.write(pendingInput); } catch { /* PTY exited */ }
+      }
+    });
+  }
+}
+
+function beginTmuxRendererRebind(state, webSocket, resizeRenderer = false) {
+  if (!state?.terminal?.useTmux || !webSocket || state.disposed) return;
+  clearInitialTmuxTimers(state);
+  state.initialTmuxBuffer = '';
+  state.initialResetSocket = null;
+  state.initialInputBuffer = '';
+  state.initialProbeSent = false;
+  state.initialResetReason = resizeRenderer ? 'renderer-resize' : 'renderer-rebind';
+  const cachedSnapshot = !resizeRenderer && state.snapshotRevision === state.outputRevision ? state.snapshotCache : '';
+  state.initialResetDone = false;
+  state.initialResetStartedAt = Date.now();
+  state.initialResetFinishing = true;
+  state.initialSyncGeneration += 1;
+  const syncGeneration = state.initialSyncGeneration;
+  if (resizeRenderer) {
+    // Put the retained tmux client at its new size before capture-pane runs.
+    // The resulting ConPTY repaint is buffered while the direct snapshot is
+    // prepared, so a resized inactive tab no longer falls back to the old
+    // half-second synchronization window.
+    try { state.terminal.child.resize(state.cols, state.rows); } catch { /* PTY exited */ }
+  }
+  void restoreTmuxRendererFromSnapshot(state, webSocket, syncGeneration, cachedSnapshot).catch((error) => {
+    if (process.env.NEXUS_DEBUG_PTY) console.warn(`[pty] unable to restore tmux renderer ${state.serverId || ''}: ${error.message}`);
+    completeTmuxRendererRebind(state, webSocket, syncGeneration, '');
+  });
+}
+
+function consumeInitialTmuxData(state, data) {
+  if (!state || state.initialResetDone) return '';
+  const chunk = String(data || '');
+  if (chunk) state.initialTmuxBuffer = `${state.initialTmuxBuffer || ''}${chunk}`.slice(-TMUX_INITIAL_BUFFER_LIMIT);
+  if (!chunk) return '';
+  // Fresh attachments are released by beginInitialTmuxAttachment as soon as
+  // the WebSocket owns the PTY. Only a renderer rebind needs the quiet-period
+  // guard while its direct capture-pane snapshot is being prepared.
+  if (state.initialResetReason !== 'fresh-attachment') scheduleInitialTmuxQuiet(state);
+  return '';
+}
+
+function writeWslInput(state, data) {
+  if (!state || !data || state.disposed || !state.terminal?.child) return;
+  // Keep all typing in order with the pane repaint. The queue is flushed as
+  // soon as the final cursor sequence arrives. Ctrl+C is the one exception:
+  // it must always reach the foreground process immediately, even while a
+  // slow tmux repaint is being quarantined.
+  if (state.terminal.useTmux && !state.initialResetDone) {
+    if (String(data).includes('\u0003')) {
+      try { state.terminal.child.write(String(data)); } catch { /* PTY exited */ }
+      return;
+    }
+    state.initialInputBuffer = `${state.initialInputBuffer || ''}${String(data)}`.slice(-TMUX_INITIAL_INPUT_LIMIT);
+    return;
+  }
+  try { state.terminal.child.write(String(data)); } catch { /* PTY exited */ }
+}
+
+function createNativeTerminal(serverId, requestedSize = {}) {
+  const terminal = spawnTerminal(serverId, requestedSize);
   const state = {
     terminal,
-    replay: '',
     webSocket: null,
+    cols: terminal.cols,
+    rows: terminal.rows,
     disposed: false,
   };
   nativeTerminals.set(serverId, state);
@@ -491,7 +898,6 @@ function createNativeTerminal(serverId) {
   terminal.child.onData((data) => {
     if (state.disposed) return;
     appendLog(serverId, data);
-    state.replay = `${state.replay}${data}`.slice(-NATIVE_REPLAY_LIMIT);
     writeToOpenSocket(state.webSocket, { type: 'output', data });
   });
   terminal.child.onExit(({ exitCode }) => {
@@ -506,28 +912,59 @@ function createNativeTerminal(serverId) {
   return state;
 }
 
-function ensureNativeTerminal(server) {
+function ensureNativeTerminal(server, requestedSize = {}) {
   const existing = nativeTerminals.get(server.id);
   if (existing && !existing.disposed) return existing;
-  return createNativeTerminal(server.id);
+  return createNativeTerminal(server.id, requestedSize);
 }
 
-function createWslTerminal(serverId) {
-  const terminal = spawnTerminal(serverId);
+function createWslTerminal(serverId, requestedSize = {}) {
+  const terminal = spawnTerminal(serverId, requestedSize);
   const state = {
     terminal,
-    replay: '',
+    serverId,
     webSocket: null,
+    cols: terminal.cols,
+    rows: terminal.rows,
+    initialResetDone: false,
+    initialResetTimer: null,
+    initialFallbackTimer: null,
+    initialResetStartedAt: 0,
+    initialTmuxBuffer: '',
+    initialResetSocket: null,
+    initialMarkerTimer: null,
+    initialInputBuffer: '',
+    initialResetReason: 'fresh-attachment',
+    initialResetMaxDelay: TMUX_SCREEN_SYNC_MAX_DELAY,
+    initialResetMinDelay: TMUX_SCREEN_SYNC_MIN_DELAY,
+    initialProbeSent: false,
+    initialSyncGeneration: 0,
+    initialResetFinishing: false,
+    outputRevision: 0,
+    snapshotCache: '',
+    snapshotRevision: -1,
+    snapshotCaptureGeneration: 0,
     disposed: false,
   };
   wslTerminals.set(serverId, state);
   ptyConnections.add(terminal);
   terminal.child.onData((data) => {
     if (state.disposed) return;
+    state.outputRevision += 1;
+    if (state.initialFallbackTimer) {
+      clearTimeout(state.initialFallbackTimer);
+      state.initialFallbackTimer = null;
+    }
+    if (terminal.useTmux && !state.initialResetDone) {
+      // Keep the first repaint buffered only while a renderer rebind is
+      // preparing its capture-pane replacement. Fresh attachments release the
+      // buffer immediately after the WebSocket is assigned.
+      consumeInitialTmuxData(state, data);
+      return;
+    }
     // tmux sessions already write through pipe-pane. Non-tmux WSL shells need
-    // the same log/replay handling as native shells.
+    // the same log handling as native shells.
     if (!terminal.useTmux) appendLog(serverId, data);
-    state.replay = `${state.replay}${data}`.slice(-NATIVE_REPLAY_LIMIT);
     writeToOpenSocket(state.webSocket, { type: 'output', data });
   });
   terminal.child.onExit(({ exitCode }) => {
@@ -542,10 +979,10 @@ function createWslTerminal(serverId) {
   return state;
 }
 
-function ensureWslTerminal(server) {
+function ensureWslTerminal(server, requestedSize = {}) {
   const existing = wslTerminals.get(server.id);
   if (existing && !existing.disposed) return existing;
-  return createWslTerminal(server.id);
+  return createWslTerminal(server.id, requestedSize);
 }
 
 function killPtyTerminal(terminal) {
@@ -562,6 +999,7 @@ function killPtyTerminal(terminal) {
 function terminateNativeTerminal(serverId) {
   const state = nativeTerminals.get(serverId);
   if (!state) return false;
+  if (state.initialResetTimer) clearTimeout(state.initialResetTimer);
   state.disposed = true;
   nativeTerminals.delete(serverId);
   ptyConnections.delete(state.terminal);
@@ -574,6 +1012,10 @@ function terminateNativeTerminal(serverId) {
 function terminateWslTerminal(serverId) {
   const state = wslTerminals.get(serverId);
   if (!state) return false;
+  if (state.initialResetTimer) clearTimeout(state.initialResetTimer);
+  if (state.initialMarkerTimer) clearTimeout(state.initialMarkerTimer);
+  state.initialResetTimer = null;
+  state.initialMarkerTimer = null;
   state.disposed = true;
   wslTerminals.delete(serverId);
   ptyConnections.delete(state.terminal);
@@ -789,18 +1231,20 @@ async function sendScreenStopCommand(server, processes) {
   await Promise.allSettled(sessions.map((session) => runGuest('screen', ['-S', session, '-X', 'stuff', `${stopCommand}\r`], { timeout: 8000 })));
 }
 
-async function matchingWslProcessIds(server) {
+async function matchingWslProcessIds(server, options = {}) {
   if (process.platform !== 'win32' || server?.shell !== 'wsl') return { processes: [], ids: [] };
   const processes = await guestProcessSnapshot();
   const matching = processes.filter((processInfo) => processMatchesServer(processInfo, server));
-  const panePids = await tmuxPanePids(server.session || `nexus-${safeId(server.id)}`);
+  const panePids = options.includePanePids === false
+    ? []
+    : await tmuxPanePids(server.session || `nexus-${safeId(server.id)}`);
   const treeRoots = [...new Set([...panePids, ...matching.map((processInfo) => processInfo.pid)])];
   const ids = processTreeIds(processes, treeRoots).filter((pid) => pid > 1);
   return { processes, ids };
 }
 
-async function signalMatchingWslProcesses(server, signal) {
-  const found = await matchingWslProcessIds(server);
+async function signalMatchingWslProcesses(server, signal, options = {}) {
+  const found = await matchingWslProcessIds(server, options);
   return signalGuestProcessIds(server, found.ids, signal);
 }
 
@@ -843,12 +1287,29 @@ async function signalPortListeners(port, signal, server) {
   return { listeners, failed, remaining: await isPortListening(port) };
 }
 
-async function stopAndRemoveServer(serverId) {
-  const server = findServer(serverId);
-  if (!server) throw new Error(`unknown server: ${serverId}`);
+/**
+ * Stop the runtime owned by one configured terminal.
+ *
+ * Deleting a terminal is intentionally stronger than closing the client: the
+ * former removes the tmux session and makes a best effort to release a
+ * configured port, while the latter keeps the tmux session so it can be
+ * re-attached after the next launch.  Keeping that distinction here prevents
+ * the close-client action from destroying a user's persistent session.
+ */
+async function stopServerRuntime(server, options = {}) {
+  if (!server) throw new Error('server is required');
+  const serverId = server.id;
   const session = server.session || `nexus-${safeId(server.id)}`;
-  const port = configuredPort(server);
-  if (port === PORT) throw new Error(`configured port ${port} belongs to the Nexus backend; correct the terminal port before deleting`);
+  const preserveSession = options.preserveSession === true;
+  const forceKill = options.forceKill !== false;
+  const operation = options.operation || (preserveSession ? 'shutdown' : 'delete');
+  const configured = configuredPort(server);
+  // Never inspect or signal the Nexus API port itself.  A malformed service
+  // configuration should not make closing the application kill its backend.
+  const port = configured === PORT ? null : configured;
+  if (configured === PORT && !preserveSession) {
+    throw new Error(`configured port ${configured} belongs to the Nexus backend; correct the terminal port before deleting`);
+  }
   // Capture the initial state so a service that is already stopped does not
   // incur the graceful-stop delays below. The value is also returned to the
   // UI as an accurate account of what the delete operation found.
@@ -861,43 +1322,86 @@ async function stopAndRemoveServer(serverId) {
   // Capture WSL process roots before killing the tmux session. A service can
   // outlive its tmux pane, especially on WSL1 where Windows cannot taskkill
   // the Linux PID reported by netstat.
-  const wslStopContext = server.shell === 'wsl' ? await matchingWslProcessIds(server) : null;
+  // Capture service identities before sending the stop command.  Shutdown
+  // excludes the tmux pane shell itself so the persistent session survives;
+  // deletion includes it because the session is about to be removed.
+  const shouldInspectWslProcesses = server.shell === 'wsl'
+    && forceKill
+    && (!preserveSession || Boolean(port) || Boolean(String(server.stopCommand || '').trim()));
+  const wslStopContext = shouldInspectWslProcesses
+    ? await matchingWslProcessIds(server, { includePanePids: !preserveSession })
+    : null;
   if (wslStopContext?.processes?.length) await sendScreenStopCommand(server, wslStopContext.processes);
+  let sessionExisted = false;
   if (nativeState && isNativeShell(server)) {
     try {
       nativeState.terminal.child.write(server.stopCommand ? `${server.stopCommand}\r` : '\u0003');
-      await waitForConfiguredPort(750);
+      if (portWasListening) await waitForConfiguredPort(750);
+      else await delay(150);
     } catch (error) {
-      console.error(`[delete] native shell stop failed for ${serverId}: ${error.message}`);
+      console.error(`[${operation}] native shell stop failed for ${serverId}: ${error.message}`);
     }
   }
-  if (isNativeShell(server)) terminateNativeTerminal(serverId);
-  else if (wslTerminals.has(serverId)) terminateWslTerminal(serverId);
-  else if (connection) connection.dispose(true);
-
-  const sessionExisted = !isNativeShell(server) && await tmuxSessionExists(session);
-  if (sessionExisted) {
+  if (isNativeShell(server)) {
+    // A native PTY is the shell itself, so there is no persistent session to
+    // retain.  The configured stop command/Ctrl+C above gets a chance to run
+    // before the PTY is closed.
+    terminateNativeTerminal(serverId);
+  } else if (server.shell === 'wsl') {
+    sessionExisted = await tmuxSessionExists(session);
     try {
-      if (server.stopCommand) await runGuest('tmux', ['send-keys', '-t', session, server.stopCommand, 'Enter'], { timeout: 8000 });
-      else await runGuest('tmux', ['send-keys', '-t', session, 'C-c'], { timeout: 8000 });
-      await waitForConfiguredPort(1500);
+      if (sessionExisted) {
+        if (server.stopCommand) await runGuest('tmux', ['send-keys', '-t', session, server.stopCommand, 'Enter'], { timeout: 8000 });
+        else await runGuest('tmux', ['send-keys', '-t', session, 'C-c'], { timeout: 8000 });
+      } else {
+        // Non-tmux WSL terminals still need a graceful input before their PTY
+        // is disposed.  This path is also used when tmux is unavailable.
+        const state = wslTerminals.get(serverId);
+        if (state?.terminal?.child) state.terminal.child.write(server.stopCommand ? `${server.stopCommand}\r` : '\u0003');
+      }
+      if (portWasListening) await waitForConfiguredPort(1500);
+      else await delay(150);
     } catch (error) {
-      console.error(`[delete] graceful stop failed for ${serverId}: ${error.message}`);
+      console.error(`[${operation}] graceful stop failed for ${serverId}: ${error.message}`);
     }
-    if (await tmuxSessionExists(session)) await runGuest('tmux', ['kill-session', '-t', session], { timeout: 8000 });
+    // Closing the client detaches its PTY but deliberately leaves the service
+    // session alive.  Deleting a terminal removes the session permanently.
+    if (!preserveSession && sessionExisted && await tmuxSessionExists(session)) {
+      await runGuest('tmux', ['kill-session', '-t', session], { timeout: 8000 });
+    }
+    if (wslTerminals.has(serverId)) terminateWslTerminal(serverId);
+  } else if (connection) {
+    connection.dispose(true);
   }
 
-  if (wslStopContext?.ids?.length) await signalGuestProcessIds(server, wslStopContext.ids, 'TERM');
-  if (server.shell === 'wsl') {
-    await waitForConfiguredPort(750);
+  // Deleting a terminal keeps its historical strong cleanup even when no port
+  // was configured.  Client shutdown is narrower: only a still-occupied,
+  // explicitly configured port justifies process-tree signalling, which avoids
+  // touching unrelated background WSL processes.
+  const shouldCleanupWslProcesses = server.shell === 'wsl'
+    && forceKill
+    && (!preserveSession || (port && await isPortListening(port)));
+  if (shouldCleanupWslProcesses) {
+    if (wslStopContext?.ids?.length) await signalGuestProcessIds(server, wslStopContext.ids, 'TERM');
+    if (portWasListening) await waitForConfiguredPort(750);
     // Re-scan after the graceful stop so children spawned by a wrapper are
-    // included before the force-kill pass.
-    await signalMatchingWslProcesses(server, 'TERM');
-    await waitForConfiguredPort(1000);
-    await signalMatchingWslProcesses(server, 'KILL');
+    // included before the force-kill pass.  The matcher is constrained by the
+    // configured service identity and working directory.
+    await signalMatchingWslProcesses(server, 'TERM', { includePanePids: !preserveSession });
+    if (port) {
+      await waitForConfiguredPort(1000);
+      if (await isPortListening(port)) await signalMatchingWslProcesses(server, 'KILL', { includePanePids: !preserveSession });
+    } else if (!preserveSession) {
+      await delay(250);
+      await signalMatchingWslProcesses(server, 'KILL', { includePanePids: false });
+    }
   }
 
-  if (portWasListening) {
+  // Port-wide taskkill is intentionally limited to terminal deletion.  During
+  // client shutdown an occupied Windows port may belong to another process;
+  // the WSL branch above already uses the configured service identity for its
+  // narrower fallback.
+  if (forceKill && !preserveSession && portWasListening) {
     // A service can outlive its wrapper. Always continue to the force-kill
     // pass when the configured port is still occupied.
     await signalPortListeners(port, 'TERM', server);
@@ -907,11 +1411,47 @@ async function stopAndRemoveServer(serverId) {
       await waitForConfiguredPort(500);
     }
   }
-  if (await isPortListening(port)) {
+  if (port && await isPortListening(port)) {
     const remaining = await portListeners(port);
     const owners = remaining.map((listener) => `${listener.source}:${listener.pid}`).join(', ');
-    throw new Error(`端口 ${port} 仍被进程占用${owners ? `（${owners}）` : ''}，已保留终端配置。请先停止占用该端口的外部服务后再删除。`);
+    throw new Error(`端口 ${port} 仍被进程占用${owners ? `（${owners}）` : ''}。`);
   }
+
+  return {
+    ok: true,
+    serverId,
+    serverName: server.name,
+    session,
+    sessionRemoved: !preserveSession && sessionExisted,
+    sessionPreserved: preserveSession && sessionExisted,
+    port: configured,
+    portWasListening,
+    portReleased: configured ? (port ? true : null) : null,
+  };
+}
+
+async function stopAllConfiguredServers() {
+  // Prevent a due schedule from starting a service again while shutdown is in
+  // progress. Each configured terminal is independent, so stop them in parallel.
+  stopScheduler();
+  const results = await Promise.all(allServers().map(async (server) => {
+    try {
+      return await stopServerRuntime(server, {
+        preserveSession: true,
+        forceKill: true,
+        operation: 'shutdown',
+      });
+    } catch (error) {
+      return { ok: false, serverId: server.id, serverName: server.name, error: error.message };
+    }
+  }));
+  return { ok: results.every((result) => result.ok), results };
+}
+
+async function stopAndRemoveServer(serverId) {
+  const server = findServer(serverId);
+  if (!server) throw new Error(`unknown server: ${serverId}`);
+  const stopped = await stopServerRuntime(server);
 
   const nextGroups = config.groups.map((group) => ({
     ...group,
@@ -924,20 +1464,13 @@ async function stopAndRemoveServer(serverId) {
   });
   const saved = saveConfig({ ...config, groups: nextGroups, schedules: nextSchedules });
   return {
-    ok: true,
-    serverId,
-    serverName: server.name,
-    session,
-    sessionRemoved: sessionExisted,
-    port,
-    portWasListening,
-    portReleased: port ? true : null,
+    ...stopped,
     config: saved,
     health: healthPayload(),
   };
 }
 
-function spawnTerminal(serverId) {
+function spawnTerminal(serverId, options = {}) {
   const server = findServer(serverId) || normalizeServer({ id: serverId, name: serverId }, serverId);
   const session = server.session || `nexus-${safeId(serverId)}`;
   const useTmux = server.shell === 'wsl' && server.tmux !== false && hasTmux();
@@ -946,7 +1479,7 @@ function spawnTerminal(serverId) {
   // wider client with dot cells outside the narrower session window.
   const pipeCommand = `cat >> ${shellQuote(guestFilePath(logPath(server.id)))}`;
   const command = useTmux
-    ? `tmux has-session -t ${session} 2>/dev/null || tmux new-session -d -s ${session} -c ${shellQuote(guestCwd(server))}; tmux set-window-option -t ${session} aggressive-resize on; tmux pipe-pane -o -t ${session} ${shellQuote(pipeCommand)}; exec tmux attach-session -d -t ${session}`
+    ? `tmux has-session -t ${session} 2>/dev/null || tmux new-session -d -s ${session} -c ${shellQuote(guestCwd(server))}; tmux set-option -t ${session} history-limit ${TMUX_HISTORY_LIMIT}; tmux set-option -t ${session} display-time ${TMUX_INITIAL_DISPLAY_TIME}; tmux set-option -t ${session} status ${TMUX_STATUS}; tmux set-window-option -t ${session} alternate-screen ${TMUX_ALTERNATE_SCREEN}; tmux set-window-option -t ${session} aggressive-resize on; tmux pipe-pane -o -t ${session} ${shellQuote(pipeCommand)}; exec tmux attach-session -d -t ${session}`
     : 'exec bash -il';
   let shell;
   let args;
@@ -968,14 +1501,16 @@ function spawnTerminal(serverId) {
       ? ['-d', WSL_CONFIG.distro || 'Ubuntu', '--cd', guestCwd(server), '--', 'bash', '-ilc', command]
       : (useTmux ? ['-ilc', command] : ['-il']);
   }
+  const cols = Math.max(20, Number(options.cols) || 120);
+  const rows = Math.max(5, Number(options.rows) || 32);
   const child = pty.spawn(shell, args, {
     name: 'xterm-256color',
-    cols: 120,
-    rows: 32,
+    cols,
+    rows,
     cwd: ptyCwd,
     env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
   });
-  return { child, server, session, cwd: server.cwd || (server.shell === 'wsl' ? guestCwd(server) : ''), useTmux, shell: server.shell };
+  return { child, server, session, cwd: server.cwd || (server.shell === 'wsl' ? guestCwd(server) : ''), useTmux, shell: server.shell, cols, rows };
 }
 
 function delay(ms) {
@@ -1040,8 +1575,6 @@ async function runServerAction(serverId, action) {
     }
     if (action === 'start' || action === 'restart') {
       resetLog(server.id);
-      const nativeState = nativeTerminals.get(server.id);
-      if (nativeState) nativeState.replay = '';
       const startCommand = action === 'restart' && server.restartCommand ? server.restartCommand : server.startCommand;
       if (startCommand) sendNativeShell(server, startCommand);
       await waitForReady(server);
@@ -1397,11 +1930,13 @@ function healthPayload() {
   return {
     ok: true,
     service: 'nexus-pty',
+    runtimeVersion: BACKEND_RUNTIME_VERSION,
     port: PORT,
     distro: WSL_CONFIG.distro,
     distroSource: WSL_CONFIG.source,
     configPath: CONFIG_PATH,
     configStamp: configFileStamp,
+    configRevision,
     logDir: LOG_DIR,
     capabilities: {
       tmux,
@@ -1449,6 +1984,10 @@ async function handleApi(request, response, url) {
         });
       }
       return json(response, 200, { rows: rows.slice(-limit), total: rows.length, files, limit });
+    }
+    if (request.method === 'POST' && url.pathname === '/api/servers/stop-all') {
+      const result = await stopAllConfiguredServers();
+      return json(response, result.ok ? 200 : 207, result);
     }
     const serverDeleteMatch = url.pathname.match(/^\/api\/servers\/([^/]+)$/);
     if (request.method === 'DELETE' && serverDeleteMatch) {
@@ -1530,7 +2069,9 @@ async function handleApi(request, response, url) {
       return json(response, 200, { schedule: next, schedules: saveConfig({ ...config, schedules }).schedules });
     }
     if (request.method === 'POST' && url.pathname === '/api/shutdown') {
-      json(response, 200, { ok: true });
+      const body = await parseBody(request);
+      const services = body.stopServices === true ? await stopAllConfiguredServers() : null;
+      json(response, services?.ok === false ? 207 : 200, { ok: services ? services.ok : true, services });
       setImmediate(shutdown);
       return;
     }
@@ -1559,15 +2100,22 @@ const server = http.createServer((request, response) => {
 
 const wss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (request, socket, head) => {
-  const match = new URL(request.url, `http://${request.headers.host || HOST}`).pathname.match(/^\/terminal\/([^/]+)$/);
+  const requestUrl = new URL(request.url, `http://${request.headers.host || HOST}`);
+  const match = requestUrl.pathname.match(/^\/terminal\/([^/]+)$/);
   if (!match) {
     socket.destroy();
     return;
   }
-  wss.handleUpgrade(request, socket, head, (webSocket) => wss.emit('connection', webSocket, decodeURIComponent(match[1])));
+  const requestedCols = Number(requestUrl.searchParams.get('cols'));
+  const requestedRows = Number(requestUrl.searchParams.get('rows'));
+  const requestedSize = {
+    cols: Number.isFinite(requestedCols) && requestedCols > 0 ? Math.max(20, requestedCols) : undefined,
+    rows: Number.isFinite(requestedRows) && requestedRows > 0 ? Math.max(5, requestedRows) : undefined,
+  };
+  wss.handleUpgrade(request, socket, head, (webSocket) => wss.emit('connection', webSocket, decodeURIComponent(match[1]), requestedSize));
 });
 
-wss.on('connection', (webSocket, serverId) => {
+wss.on('connection', (webSocket, serverId, requestedSize = {}) => {
   const configuredServer = findServer(serverId) || normalizeServer({ id: serverId, name: serverId }, serverId);
   const previous = activeTerminalConnections.get(serverId);
   if (previous) previous.dispose(true);
@@ -1575,7 +2123,7 @@ wss.on('connection', (webSocket, serverId) => {
   if (isNativeShell(configuredServer)) {
     let state;
     try {
-      state = ensureNativeTerminal(configuredServer);
+      state = ensureNativeTerminal(configuredServer, requestedSize);
     } catch (error) {
       console.error(`[pty] failed to create ${serverId}`, error);
       writeToOpenSocket(webSocket, { type: 'status', value: 'error', message: error.message });
@@ -1592,13 +2140,16 @@ wss.on('connection', (webSocket, serverId) => {
     };
     state.webSocket = webSocket;
     activeTerminalConnections.set(serverId, { webSocket, terminal: state.terminal, dispose: detach });
-    writeToOpenSocket(webSocket, { type: 'status', value: 'connected', serverId, cwd: state.terminal.cwd, session: '', tmux: false, shell: configuredServer.shell });
-    if (state.replay) writeToOpenSocket(webSocket, { type: 'output', data: state.replay, replay: true });
+    writeToOpenSocket(webSocket, { type: 'status', value: 'connected', serverId, cwd: state.terminal.cwd, session: '', tmux: false, shell: configuredServer.shell, cols: state.cols, rows: state.rows });
     webSocket.on('message', (raw) => {
       try {
         const message = JSON.parse(raw.toString());
         if (message.type === 'input') state.terminal.child.write(String(message.data || ''));
-        if (message.type === 'resize') state.terminal.child.resize(Math.max(20, Number(message.cols) || 120), Math.max(5, Number(message.rows) || 32));
+        if (message.type === 'resize') {
+          state.cols = Math.max(20, Number(message.cols) || 120);
+          state.rows = Math.max(5, Number(message.rows) || 32);
+          state.terminal.child.resize(state.cols, state.rows);
+        }
       } catch (error) {
         writeToOpenSocket(webSocket, { type: 'status', value: 'error', message: error.message });
       }
@@ -1610,8 +2161,10 @@ wss.on('connection', (webSocket, serverId) => {
 
   if (configuredServer.shell === 'wsl') {
     let state;
+    const existingState = wslTerminals.get(serverId);
+    const creatingTerminal = !existingState || existingState.disposed;
     try {
-      state = ensureWslTerminal(configuredServer);
+      state = ensureWslTerminal(configuredServer, requestedSize);
     } catch (error) {
       console.error(`[pty] failed to create ${serverId}`, error);
       writeToOpenSocket(webSocket, { type: 'status', value: 'error', message: error.message });
@@ -1625,16 +2178,49 @@ wss.on('connection', (webSocket, serverId) => {
       if (state.webSocket === webSocket) state.webSocket = null;
       if (activeTerminalConnections.get(serverId)?.webSocket === webSocket) activeTerminalConnections.delete(serverId);
       if (closeSocket && webSocket.readyState === WebSocket.OPEN) webSocket.close(4001, 'replaced by a newer terminal connection');
+      if (state.terminal.useTmux && state.initialResetDone) void refreshTmuxSnapshotCache(state);
     };
+    const freshAttachment = state.terminal.useTmux && creatingTerminal;
+    const reboundAttachment = state.terminal.useTmux && !creatingTerminal;
+    const requestedCols = Math.max(20, Number(requestedSize.cols) || state.cols || 120);
+    const requestedRows = Math.max(5, Number(requestedSize.rows) || state.rows || 32);
+    const dimensionsChanged = requestedCols !== state.cols || requestedRows !== state.rows;
     state.webSocket = webSocket;
     activeTerminalConnections.set(serverId, { webSocket, terminal: state.terminal, dispose: detach });
-    writeToOpenSocket(webSocket, { type: 'status', value: 'connected', serverId, cwd: state.terminal.cwd, session: state.terminal.session, tmux: state.terminal.useTmux, shell: state.terminal.shell });
-    if (state.replay) writeToOpenSocket(webSocket, { type: 'output', data: state.replay, replay: true });
+    if (dimensionsChanged) {
+      state.cols = requestedCols;
+      state.rows = requestedRows;
+    }
+    if (freshAttachment && !state.initialResetDone) {
+      state.initialResetSocket = null;
+      state.initialResetReason = 'fresh-attachment';
+      beginInitialTmuxAttachment(state, webSocket);
+    } else if (reboundAttachment) {
+      // The common case restores a capture made when this renderer detached.
+      // If the layout changed while the tab was inactive, resize first and
+      // capture the newly laid-out pane instead of waiting for a PTY repaint.
+      beginTmuxRendererRebind(state, webSocket, dimensionsChanged);
+    }
+    if (!state.terminal.useTmux && dimensionsChanged) {
+      state.terminal.child.resize(state.cols, state.rows);
+    }
+    writeToOpenSocket(webSocket, { type: 'status', value: 'connected', serverId, cwd: state.terminal.cwd, session: state.terminal.session, tmux: state.terminal.useTmux, shell: state.terminal.shell, fresh: freshAttachment, rebound: reboundAttachment, syncing: state.terminal.useTmux && !state.initialResetDone, cols: state.cols, rows: state.rows });
     webSocket.on('message', (raw) => {
       try {
         const message = JSON.parse(raw.toString());
-        if (message.type === 'input') state.terminal.child.write(String(message.data || ''));
-        if (message.type === 'resize') state.terminal.child.resize(Math.max(20, Number(message.cols) || 120), Math.max(5, Number(message.rows) || 32));
+        if (message.type === 'input') {
+          const data = String(message.data || '');
+          writeWslInput(state, data);
+        }
+        if (message.type === 'resize') {
+          const cols = Math.max(20, Number(message.cols) || 120);
+          const rows = Math.max(5, Number(message.rows) || 32);
+          if (cols !== state.cols || rows !== state.rows) {
+            state.cols = cols;
+            state.rows = rows;
+            state.terminal.child.resize(state.cols, state.rows);
+          }
+        }
       } catch (error) {
         writeToOpenSocket(webSocket, { type: 'status', value: 'error', message: error.message });
       }

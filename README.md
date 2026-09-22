@@ -65,7 +65,7 @@ cd E:\airtest\terminal_maneger
 npm.cmd run dev
 ```
 
-该命令会启动 Vite、Electron，以及由 Electron 管理的本地 WSL 后端。应用窗口打开后，右上角应显示“本地后端 · 已连接”。窗口最小化时后端和调度器继续运行；正常退出应用时调度器停止，已有 tmux 服务会话保留。
+该命令会启动 Vite、Electron，以及由 Electron 管理的本地 WSL 后端。应用窗口打开后，右上角应显示“本地后端 · 已连接”。窗口最小化时后端和调度器继续运行；点击关闭按钮会弹出处理选项：关闭服务并关闭客户端，或最小化到系统托盘。关闭客户端时调度器停止，已有 `nexus-*` tmux 服务会话保留，便于下次重新接入。
 
 ### 仅预览网页
 
@@ -141,6 +141,7 @@ Electron 后端连接成功后，右侧是 xterm.js PTY 画布，不是静态文
 - Ctrl+C 中断命令。
 - ANSI 颜色、光标和窗口尺寸同步。
 - 断线自动重连；新连接会接管旧连接，避免切换终端时闪烁。
+- 每次启动新的应用实例时以干净终端开始；之前的输出请到“日志检索”查看。
 - 终端滚动、鼠标选择复制和 Ctrl+Shift+C 复制。
 - 工具栏搜索当前终端画布内容。
 
@@ -238,6 +239,10 @@ Electron 后端连接成功后，右侧是 xterm.js PTY 画布，不是静态文
 - 用户确认后安装 tmux。
 - 查看固定的 `backend/servers.json` 配置路径和运行说明。
 
+### 关闭客户端
+
+关闭窗口时可以选择“关闭服务并关闭客户端”或“最小化到托盘”。选择“下次不再提醒”后，应用会记住本次动作；之后可在设置页的“关闭客户端”区域重新开启提醒，或修改免提醒时的默认动作。最小化到托盘不会停止服务和定时任务，托盘菜单可恢复窗口；“退出客户端（保留服务）”可在托盘菜单中使用。
+
 ## Agent / MCP 接入
 
 项目内置使用标准输入输出通信的本地 MCP Server，不监听额外网络端口。先启动 Nexus Electron，再在支持 MCP 的 Agent 中添加：
@@ -283,6 +288,7 @@ NEXUS_MCP_ALLOW_COMMANDS = "1"
 | GET | `/health` | 查看 WSL、Node、tmux 和终端状态 |
 | GET / PUT | `/api/config` | 读取或保存完整配置 |
 | POST | `/api/servers/:id/action` | 执行服务动作 |
+| POST | `/api/servers/stop-all` | 关闭客户端前停止已配置服务并保留 tmux 会话 |
 | DELETE | `/api/servers/:id` | 停止、清理并删除终端 |
 | POST | `/api/commands/dispatch` | 并行广播命令 |
 | POST | `/api/workflows/:id/run` | 运行服务编排 |

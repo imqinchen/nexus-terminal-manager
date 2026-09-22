@@ -284,6 +284,15 @@ h1 { font-size: 27px; line-height: 1.2; letter-spacing: -.5px; font-weight: 700;
 .dependency-error svg { flex: 0 0 auto; margin-top: 1px; }
 .settings-notes { display: flex; flex-direction: column; gap: 9px; padding: 16px; color: var(--muted); font-size: 11px; line-height: 1.6; }
 .settings-notes p { margin: 0; }
+.settings-checkbox-row { min-height: 54px; display: flex; align-items: center; gap: 11px; cursor: pointer; }
+.settings-checkbox-row input { width: 17px; height: 17px; flex: 0 0 auto; margin: 0; accent-color: var(--mint); cursor: pointer; }
+.settings-checkbox-row > span { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.settings-checkbox-row strong { color: var(--text); font-size: 12px; }
+.settings-checkbox-row small { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.close-behavior-picker { display: flex; align-items: center; gap: 12px; min-height: 38px; }
+.close-behavior-picker label { flex: 0 0 190px; color: var(--muted); font-size: 11px; }
+.close-behavior-picker select { min-width: 280px; height: 36px; border: 1px solid var(--line); outline: 0; padding: 0 10px; color: var(--text); background: var(--surface-2); font-size: 11px; }
+.close-behavior-picker select:focus { border-color: var(--mint); box-shadow: 0 0 0 2px color-mix(in srgb, var(--mint), transparent 84%); }
 .panel-heading { min-height: 56px; border-bottom: 1px solid var(--line-soft); display: flex; align-items: center; justify-content: space-between; padding: 0 16px; }
 .panel-heading h3 { font-size: 13px; }
 .panel-heading span { display: block; color: var(--muted); font-size: 11px; margin-top: 4px; }
@@ -339,13 +348,14 @@ h1 { font-size: 27px; line-height: 1.2; letter-spacing: -.5px; font-weight: 700;
 .rotate-180 { transform: rotate(180deg); }
 .xterm-host { flex: 1; min-height: 360px; overflow: hidden; background: var(--terminal-bg); }
 .xterm-host .xterm { position: relative; height: 100%; min-height: 0; padding: 12px 14px 9px; }
-/* xterm v6 renders history through its own scrollable element. The legacy
-   viewport is still present with overflow-y: scroll, which otherwise creates
-   a second native scrollbar beside xterm's draggable slider. */
+/* Let xterm.js own the history viewport and its draggable scrollbar. The
+   legacy viewport is kept from adding a second browser scrollbar. */
 .xterm-host .xterm-viewport { background: var(--terminal-bg) !important; overflow: hidden !important; scrollbar-width: none; }
 .xterm-host .xterm-viewport::-webkit-scrollbar { width: 0 !important; height: 0 !important; display: none; }
 .xterm-host .xterm-scrollable-element { position: relative !important; width: 100% !important; height: 100% !important; min-height: 0; overflow: visible !important; }
-.xterm-host .xterm-scrollable-element > .scrollbar.vertical.visible { width: 14px !important; right: 0 !important; z-index: 12; opacity: 1 !important; pointer-events: auto !important; background: color-mix(in srgb, var(--text), transparent 93%); }
+.xterm-host .xterm-scrollable-element > .scrollbar.vertical,
+.xterm-host .xterm-scrollable-element > .scrollbar.vertical.visible,
+.xterm-host .xterm-scrollable-element > .scrollbar.vertical.invisible { width: 14px !important; right: 0 !important; z-index: 12; opacity: 1 !important; pointer-events: auto !important; background: color-mix(in srgb, var(--text), transparent 93%); }
 .xterm-host .xterm-scrollable-element > .scrollbar.vertical > .slider { width: 14px !important; min-height: 28px; border-radius: 2px; background: var(--terminal-scrollbar-thumb) !important; }
 .xterm-host .xterm-scrollable-element > .scrollbar.vertical > .slider:hover { background: var(--terminal-scrollbar-thumb-hover) !important; }
 .xterm-host .xterm-scrollable-element > .scrollbar.vertical > .slider.active { background: var(--terminal-scrollbar-thumb-active) !important; }
@@ -369,7 +379,7 @@ mark { color: #101a19; background: var(--amber); padding: 1px 2px; }
 .terminal-input-row button { width: 45px; height: 100%; border: 0; color: var(--mint); background: transparent; cursor: pointer; display: grid; place-items: center; }
 .terminal-footer { height: 30px; flex: 0 0 30px; gap: 16px; padding: 0 17px; color: var(--muted-2); font: 10px 'DM Mono', monospace; border-top: 1px solid var(--line-soft); background: var(--terminal-chrome); }
 .terminal-footer span:first-child { color: #7ba99d; display: flex; align-items: center; gap: 5px; }
-.terminal-footer .pty-preview { color: var(--amber); }.terminal-footer .pty-connected { color: #7ba99d; }
+.terminal-footer .pty-preview { color: var(--amber); }.terminal-footer .pty-connecting { color: var(--blue); }.terminal-footer .pty-connected { color: #7ba99d; }
 
 .log-toolbar { min-height: 67px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px 0 17px; margin-bottom: 10px; }
 .logs-inline-filter { display: flex; justify-content: flex-end; align-items: center; gap: 7px; margin: -10px 0 10px; color: var(--muted); font: 10px 'DM Mono', monospace; }
@@ -499,6 +509,16 @@ kbd { color: var(--muted-2); border: 1px solid var(--line); padding: 3px 5px; fo
 .command-mode-options button { min-width: 120px; justify-content: center; }
 .scope-options button.selected { border-color: #4f8b7d; color: var(--mint); background: #18312d; }
 .modal-footer { display: flex; justify-content: flex-end; gap: 8px; padding: 13px 22px; border-top: 1px solid var(--line-soft); background: #0e171e; }
+.delete-server-modal { width: min(460px, 100%); }
+.delete-server-icon { flex: 0 0 auto; color: var(--amber); }
+.delete-server-content { display: flex; flex-direction: column; gap: 12px; padding: 21px 22px 22px; color: var(--muted); font-size: 12px; line-height: 1.65; }
+.delete-server-content p { margin: 0; }
+.delete-server-content strong { color: var(--text); }
+.delete-server-content code { display: block; overflow-wrap: anywhere; padding: 8px 10px; border: 1px solid var(--line-soft); color: var(--muted-2); background: #0b1319; font: 11px 'DM Mono', monospace; }
+.delete-server-note { color: var(--muted-2); }
+.danger-button { display: inline-flex; align-items: center; gap: 7px; min-height: 32px; padding: 0 12px; border: 1px solid #9d4b4b; color: #ffe0e0; background: #682f34; cursor: pointer; font: 12px inherit; }
+.danger-button:hover:not(:disabled) { background: #7a393f; }
+.danger-button:disabled { opacity: .6; cursor: wait; }
 
 @media (max-width: 1080px) {
   .content-scroll { padding-left: 24px; padding-right: 24px; }
@@ -529,6 +549,12 @@ kbd { color: var(--muted-2); border: 1px solid var(--line); padding: 3px 5px; fo
   .overview-progress { width: 78px; }.overview-health-state { display: none; }.overview-service-row { gap: 8px; padding-left: 11px; padding-right: 11px; }.overview-service-row .status-badge { min-width: 62px; }.overview-service-stat { display: none; }.selection-actions { justify-content: flex-start; }
   .language-options { grid-template-columns: 1fr; }.settings-path-actions { align-items: flex-start; flex-direction: column; }
   .field-row { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 820px) {
+  .close-behavior-picker { align-items: stretch; flex-direction: column; gap: 7px; }
+  .close-behavior-picker label { flex-basis: auto; }
+  .close-behavior-picker select { width: 100%; min-width: 0; }
 }
 
 .terminal-command-bar { min-height: 54px; margin-bottom: 12px; padding: 0 15px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -765,6 +791,8 @@ kbd { color: var(--muted-2); border: 1px solid var(--line); padding: 3px 5px; fo
 :root[data-theme='light'] .terminal-command-menu > button:hover { background: #edf3f4; }
 :root[data-theme='light'] .modal-backdrop { background: rgba(27, 41, 47, .42); }
 :root[data-theme='light'] .modal-footer { background: #f3f6f7; }
+:root[data-theme='light'] .delete-server-content code { border-color: #d4e0e3; color: #4c6269; background: #f4f8f9; }
+:root[data-theme='light'] .danger-button { border-color: #b84f59; color: #ffffff; background: #c84f5b; }
 :root[data-theme='light'] .swatch.selected { border-color: #23353c; box-shadow: 0 0 0 2px #dae3e5; }
 
 :root[data-theme='light'] .server-icon-running,

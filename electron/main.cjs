@@ -1,4 +1,4 @@
-const { app, BrowserWindow, clipboard, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, shell, Tray } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
@@ -7,10 +7,24 @@ const { detectWslDistro } = require('../backend/wsl-config.cjs');
 
 const BACKEND_PORT = Number(process.env.NEXUS_PTY_PORT || 4317);
 const BACKEND_HOST = process.env.NEXUS_PTY_HOST || '127.0.0.1';
+// Keep the Electron shell and the PTY backend in lockstep. A stale backend
+// process can otherwise survive an app restart and keep serving the removed
+// connection banner/handshake behavior.
+const EXPECTED_BACKEND_RUNTIME_VERSION = 16;
 let mainWindow;
 let backendProcess;
 let backendManaged = false;
 let quitting = false;
+let tray;
+let hiddenToTray = false;
+let closeRequestInFlight = false;
+let allowWindowClose = false;
+
+const DEFAULT_APP_SETTINGS = {
+  closePromptDisabled: false,
+  closeBehavior: 'tray',
+  language: 'zh-CN',
+};
 
 if (app.isPackaged) app.setPath('userData', path.join(app.getPath('appData'), 'Nexus Control'));
 
@@ -36,6 +50,47 @@ function ensureRuntimeData() {
     fs.copyFileSync(path.join(paths.sourceBackendDir, 'servers.example.json'), paths.configPath);
   }
   return paths;
+}
+
+function appSettingsPath() {
+  return path.join(app.getPath('userData'), 'preferences.json');
+}
+
+function normalizeAppSettings(raw) {
+  const value = raw && typeof raw === 'object' ? raw : {};
+  return {
+    ...DEFAULT_APP_SETTINGS,
+    closePromptDisabled: value.closePromptDisabled === true,
+    closeBehavior: value.closeBehavior === 'stop' ? 'stop' : 'tray',
+    language: value.language === 'en-US' ? 'en-US' : 'zh-CN',
+  };
+}
+
+function readAppSettings() {
+  try {
+    return normalizeAppSettings(JSON.parse(fs.readFileSync(appSettingsPath(), 'utf8')));
+  } catch {
+    return { ...DEFAULT_APP_SETTINGS };
+  }
+}
+
+function saveAppSettings(patch = {}) {
+  const next = normalizeAppSettings({ ...readAppSettings(), ...patch });
+  const filePath = appSettingsPath();
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(tempPath, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  try {
+    fs.renameSync(tempPath, filePath);
+  } catch {
+    // Windows cannot always rename over an existing file. A short copy fallback
+    // still keeps the preference file valid and scoped to the app user data.
+    fs.copyFileSync(tempPath, filePath);
+    try { fs.unlinkSync(tempPath); } catch { /* best effort cleanup */ }
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('app-settings-changed', next);
+  updateTrayMenu();
+  return next;
 }
 
 function requestBackend(endpoint, options = {}) {
@@ -114,6 +169,22 @@ function waitForBackend(timeout = 10000) {
   });
 }
 
+function waitForBackendOffline(timeout = 4000) {
+  const startedAt = Date.now();
+  return new Promise((resolve) => {
+    const check = () => {
+      requestBackend('/health', { timeout: 400 }).then(() => {
+        if (Date.now() - startedAt >= timeout) {
+          resolve(false);
+          return;
+        }
+        setTimeout(check, 100);
+      }).catch(() => resolve(true));
+    };
+    check();
+  });
+}
+
 function attachBackendOutput(child) {
   child.stdout?.on('data', (data) => console.log(`[wsl] ${String(data).trimEnd()}`));
   child.stderr?.on('data', (data) => console.error(`[wsl] ${String(data).trimEnd()}`));
@@ -127,13 +198,18 @@ function attachBackendOutput(child) {
 async function startWslBackend() {
   const distroConfig = detectWslDistro();
   const existing = await waitForBackend(500);
-  if (existing?.ok && existing.capabilities?.platform === 'win32') {
+  const compatible = existing?.ok && existing.runtimeVersion === EXPECTED_BACKEND_RUNTIME_VERSION;
+  if (compatible && existing.capabilities?.platform === 'win32') {
     backendManaged = false;
     return { started: false, reused: true, available: true, distro: existing.distro || distroConfig.distro, health: existing };
   }
   if (existing?.ok) {
     try { await requestBackend('/api/shutdown', { method: 'POST', timeout: 1500 }); } catch { /* stale backend may exit first */ }
-    await new Promise((resolve) => setTimeout(resolve, 400));
+    const stopped = await waitForBackendOffline(4000);
+    if (!stopped) {
+      console.error('[backend] an incompatible backend is still listening on the configured port');
+      return { started: false, reused: false, available: false, distro: distroConfig.distro, reason: 'stale-backend' };
+    }
   }
 
   const paths = ensureRuntimeData();
@@ -152,7 +228,7 @@ async function startWslBackend() {
   backendManaged = true;
   attachBackendOutput(child);
   const health = await waitForBackend(10000);
-  if (!health?.ok) {
+  if (!health?.ok || health.runtimeVersion !== EXPECTED_BACKEND_RUNTIME_VERSION) {
     console.error('[backend] local terminal backend did not become healthy');
     try { child.kill(); } catch { /* already exited */ }
     backendProcess = undefined;
@@ -162,14 +238,152 @@ async function startWslBackend() {
   return { started: true, available: true, distro: health.distro || distroConfig.distro, health };
 }
 
-async function stopWslBackend() {
+async function stopWslBackend({ stopServices = false } = {}) {
+  if (stopServices && !backendManaged && !backendProcess) {
+    // A developer may have started the backend separately. Stop configured
+    // services through its API, but do not terminate a process we do not own.
+    try {
+      await requestBackend('/api/servers/stop-all', { method: 'POST', timeout: 30000 });
+    } catch (error) {
+      console.error(`[backend] service stop request failed: ${error.message}`);
+    }
+    return;
+  }
   if (!backendManaged && !backendProcess) return;
-  try { await requestBackend('/api/shutdown', { method: 'POST', timeout: 1500 }); } catch { /* backend may already be down */ }
+  try {
+    await requestBackend('/api/shutdown', {
+      method: 'POST',
+      body: { stopServices: Boolean(stopServices) },
+      timeout: stopServices ? 30000 : 3000,
+    });
+  } catch (error) {
+    console.error(`[backend] shutdown request failed: ${error.message}`);
+  }
   if (backendProcess) {
     try { backendProcess.kill(); } catch { /* already exited */ }
     backendProcess = undefined;
   }
   backendManaged = false;
+}
+
+function createTrayIcon() {
+  // Keep a real PNG buffer embedded so Windows' notification area does not
+  // discard an SVG data URL or render it as a fully transparent icon. The
+  // opaque blue tile also stays visible on both light and dark taskbars.
+  const pngBase64 = 'iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAWUlEQVR42mPgULb9P5CYYdA4wHjOf7riUQeMOmBoOAAdEGs4MfpGHUCWA/AZSoraUQcMDweQAkYdMOoAmpSE5MqNOmBoOYDSGo+mLaJRB4y2iqnugBHbOwYA3MX1MekKZ+YAAAAASUVORK5CYII=';
+  try {
+    const image = nativeImage.createFromBuffer(Buffer.from(pngBase64, 'base64'));
+    if (image.isEmpty()) return nativeImage.createEmpty();
+    return image.resize({ width: 16, height: 16 });
+  } catch {
+    return nativeImage.createEmpty();
+  }
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+  hiddenToTray = false;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
+  const isZh = readAppSettings().language !== 'en-US';
+  tray.setToolTip(isZh ? 'Nexus Control 本地终端管理器' : 'Nexus Control local terminal manager');
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: isZh ? '显示窗口' : 'Show window', click: showMainWindow },
+    { label: isZh ? '隐藏窗口' : 'Hide window', click: () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide(); hiddenToTray = true; } },
+    { type: 'separator' },
+    {
+      label: isZh ? '退出客户端（保留服务）' : 'Exit client (keep services)',
+      click: () => { void completeQuit(false); },
+    },
+    { label: isZh ? '关闭服务并退出' : 'Stop services and quit', click: () => { void completeQuit(true); } },
+  ]));
+}
+
+function ensureTray() {
+  if (tray) return tray;
+  tray = new Tray(createTrayIcon());
+  tray.on('click', showMainWindow);
+  tray.on('double-click', showMainWindow);
+  updateTrayMenu();
+  return tray;
+}
+
+function minimizeToTray() {
+  ensureTray();
+  hiddenToTray = true;
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.hide();
+}
+
+async function completeQuit(stopServices) {
+  if (quitting) return;
+  quitting = true;
+  hiddenToTray = false;
+  allowWindowClose = true;
+  if (tray) {
+    tray.destroy();
+    tray = undefined;
+  }
+  try {
+    await stopWslBackend({ stopServices });
+  } finally {
+    // app.exit bypasses another before-quit round, so the close dialog cannot
+    // re-enter while the backend is being stopped.
+    app.exit(0);
+  }
+}
+
+async function requestClose() {
+  if (quitting || closeRequestInFlight) return;
+  closeRequestInFlight = true;
+  try {
+    const settings = readAppSettings();
+    if (settings.closePromptDisabled) {
+      if (settings.closeBehavior === 'stop') await completeQuit(true);
+      else minimizeToTray();
+      return;
+    }
+
+    const isZh = settings.language !== 'en-US';
+    const dialogOptions = {
+      type: 'warning',
+      buttons: [
+        isZh ? '关闭服务并关闭客户端' : 'Stop services and quit',
+        isZh ? '最小化到托盘' : 'Minimize to tray',
+        isZh ? '取消' : 'Cancel',
+      ],
+      defaultId: 1,
+      cancelId: 2,
+      noLink: true,
+      checkboxLabel: isZh ? '下次不再提醒' : 'Do not ask again',
+      checkboxChecked: false,
+      title: isZh ? '关闭 Nexus Control' : 'Close Nexus Control',
+      message: isZh ? '请选择关闭客户端时的处理方式' : 'Choose what should happen when closing the client',
+      detail: isZh
+        ? '关闭服务会向已配置的终端发送停止指令并停止本地后端。最小化到托盘会保留服务和定时任务运行。'
+        : 'Stopping services sends their configured stop command and stops the local backend. Minimizing keeps services and schedules running.',
+    };
+    const parentWindow = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : null;
+    const result = parentWindow
+      ? await dialog.showMessageBox(parentWindow, dialogOptions)
+      : await dialog.showMessageBox(dialogOptions);
+    if (result.response === 2) return;
+    const choice = result.response === 0 ? 'stop' : 'tray';
+    saveAppSettings({ closeBehavior: choice, closePromptDisabled: result.checkboxChecked === true });
+    if (choice === 'stop') await completeQuit(true);
+    else minimizeToTray();
+  } catch (error) {
+    console.error(`[main] close request failed: ${error.message}`);
+  } finally {
+    closeRequestInFlight = false;
+  }
 }
 
 function createWindow() {
@@ -195,6 +409,11 @@ function createWindow() {
   else mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.webContents.on('did-fail-load', (_event, code, description) => console.error('[renderer] failed to load', code, description));
+  mainWindow.on('close', (event) => {
+    if (quitting || allowWindowClose || hiddenToTray) return;
+    event.preventDefault();
+    void requestClose();
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
@@ -210,6 +429,23 @@ ipcMain.handle('wsl-status', async () => {
 });
 
 ipcMain.handle('start-wsl-backend', () => startWslBackend());
+ipcMain.handle('focus-main-window', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  mainWindow.show();
+  mainWindow.focus();
+  mainWindow.webContents.focus();
+  return true;
+});
+ipcMain.handle('get-app-settings', () => readAppSettings());
+ipcMain.handle('set-app-settings', (_event, patch) => saveAppSettings(patch));
+ipcMain.handle('close-client', (_event, options = {}) => {
+  const stopServices = options?.behavior === 'stop';
+  if (!stopServices) {
+    minimizeToTray();
+    return Promise.resolve({ ok: true, behavior: 'tray' });
+  }
+  return completeQuit(true).then(() => ({ ok: true, behavior: 'stop' }));
+});
 ipcMain.handle('install-tmux', async (_event, language = 'zh-CN') => {
   if (process.platform !== 'win32') return { ok: false, error: 'tmux installation is only supported from Windows WSL.' };
   const distro = detectWslDistro().distro;
@@ -268,6 +504,7 @@ ipcMain.handle('copy-text', (_event, value) => {
   clipboard.writeText(String(value || ''));
   return { ok: true };
 });
+ipcMain.handle('read-clipboard-text', () => clipboard.readText());
 ipcMain.handle('export-command-library', async (_event, commands) => {
   const allowedTones = new Set(['mint', 'blue', 'amber', 'violet']);
   const exportedCommands = (Array.isArray(commands) ? commands : []).slice(0, 5000).map((command) => ({
@@ -360,12 +597,12 @@ app.whenReady().then(async () => {
 app.on('before-quit', (event) => {
   if (quitting) return;
   event.preventDefault();
-  quitting = true;
-  stopWslBackend().finally(() => app.exit(0));
+  void requestClose();
 });
 
 app.on('window-all-closed', () => {
   if (process.platform === 'darwin') return;
-  // before-quit handles backend shutdown; this is intentionally not a tray app.
-  if (!quitting) app.quit();
+  // Hiding the window for the tray does not normally emit this event, but keep
+  // the guard for platform-specific window managers.
+  if (!quitting && !hiddenToTray) void requestClose();
 });

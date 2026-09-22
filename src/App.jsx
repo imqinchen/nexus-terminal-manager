@@ -36,6 +36,7 @@ import {
   PanelLeft,
   Pencil,
   Play,
+  Power,
   Plus,
   Radio,
   RefreshCw,
@@ -380,7 +381,6 @@ function browserImportCommandLibrary() {
 }
 
 const BACKEND_BASE = window.desktop?.backendUrl || 'http://127.0.0.1:4317';
-
 async function backendRequest(endpoint, options = {}) {
   if (window.desktop?.backendRequest) {
     return window.desktop.backendRequest({ path: endpoint, method: options.method || 'GET', body: options.body, timeout: options.timeout });
@@ -416,12 +416,27 @@ function hydrateGroups(rawGroups) {
   }));
 }
 
-function socketUrlFor(serverId) {
+function socketUrlFor(serverId, size = {}) {
   const base = new URL(BACKEND_BASE);
   base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
   base.pathname = `/terminal/${encodeURIComponent(serverId)}`;
-  base.search = '';
+  base.search = Number(size.cols) > 0 && Number(size.rows) > 0
+    ? `?cols=${encodeURIComponent(Math.round(size.cols))}&rows=${encodeURIComponent(Math.round(size.rows))}`
+    : '';
   return base.toString();
+}
+
+function removeLegacyPtyBanner(value) {
+  const text = String(value || '');
+  if (!/PTY\s+(?:ready|connected)\b/i.test(text)) return text;
+  // Older Nexus backends wrote a connection banner into the PTY stream. Keep
+  // the current xterm canvas clean even when a user has an old backend still
+  // listening on 4317; the current Electron handshake will replace it on the
+  // next launch.
+  return text.replace(/(?:^|[\r\n])[^\r\n]*\bPTY\s+(?:ready|connected)\b[^\r\n]*(?:\r\n|\r|\n|$)/gi, (line) => {
+    const prefix = line.match(/^[\r\n]+/)?.[0] || '';
+    return prefix;
+  });
 }
 
 function terminalPalette(theme) {
@@ -490,6 +505,8 @@ function App() {
   const [commands, setCommandsState] = useState(() => loadLocalState('nexus.commands', commandLibrary));
   const [language, setLanguage] = useState(() => loadLocalState('nexus.language', 'zh-CN'));
   const [theme, setTheme] = useState(() => loadLocalState('nexus.theme', 'dark'));
+  const [closePromptDisabled, setClosePromptDisabled] = useState(() => loadLocalState('nexus.closePromptDisabled', false));
+  const [closeBehavior, setCloseBehavior] = useState(() => loadLocalState('nexus.closeBehavior', 'tray'));
   const [activeNav, setActiveNav] = useState('terminal');
   const [activeServerId, setActiveServerId] = useState('');
   const [selectedIds, setSelectedIds] = useState(new Set());
@@ -511,9 +528,19 @@ function App() {
   const [backendHealth, setBackendHealth] = useState(null);
   const [serverBusy, setServerBusy] = useState(new Set());
   const [configReloading, setConfigReloading] = useState(false);
+  // Bump this only when a configuration operation needs the visible PTY to
+  // reconnect.  In particular, deleting a *different* terminal must not
+  // leave the current xterm attached to an obsolete renderer/WebSocket.
+  const [terminalReconnectEpoch, setTerminalReconnectEpoch] = useState(0);
   const configStampRef = useRef(null);
+  const configBackendRevisionRef = useRef(0);
   const configEditRevisionRef = useRef(0);
+  const configSyncEpochRef = useRef(0);
   const configDirtyRef = useRef(false);
+  // All PUTs share one queue.  A delete waits for an already-started PUT, so
+  // an older browser snapshot can never overwrite the just-deleted terminal.
+  const configWriteQueueRef = useRef(Promise.resolve());
+  const appSettingsHydratedRef = useRef(false);
 
   const updateLocalConfig = (setter, value) => {
     configEditRevisionRef.current += 1;
@@ -528,7 +555,6 @@ function App() {
   const servers = useMemo(() => flattenGroups(groups), [groups]);
   const activeServer = servers.find((server) => server.id === activeServerId) || servers[0];
   const selectedServers = servers.filter((server) => selectedIds.has(server.id));
-  const activeLines = linesByServer[activeServer?.id] || [];
   const filteredCommands = commands.filter((item) => `${item.name} ${item.command} ${item.description}`.toLowerCase().includes(commandQuery.toLowerCase()));
 
   useEffect(() => {
@@ -547,6 +573,7 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem('nexus.language', language);
     document.documentElement.lang = language;
+    if (appSettingsHydratedRef.current) window.desktop?.setAppSettings?.({ language });
   }, [language]);
 
   useEffect(() => {
@@ -555,6 +582,48 @@ function App() {
     document.documentElement.dataset.theme = nextTheme;
     document.documentElement.style.colorScheme = nextTheme;
   }, [theme]);
+
+  useEffect(() => {
+    const nextBehavior = closeBehavior === 'stop' ? 'stop' : 'tray';
+    window.localStorage.setItem('nexus.closePromptDisabled', JSON.stringify(Boolean(closePromptDisabled)));
+    window.localStorage.setItem('nexus.closeBehavior', JSON.stringify(nextBehavior));
+    if (appSettingsHydratedRef.current) {
+      window.desktop?.setAppSettings?.({ closePromptDisabled: Boolean(closePromptDisabled), closeBehavior: nextBehavior });
+    }
+  }, [closePromptDisabled, closeBehavior]);
+
+  useEffect(() => {
+    let alive = true;
+    const applyAppSettings = (settings) => {
+      if (!settings || typeof settings !== 'object') return;
+      if (settings.closePromptDisabled !== undefined) setClosePromptDisabled(settings.closePromptDisabled === true);
+      if (settings.closeBehavior) setCloseBehavior(settings.closeBehavior === 'stop' ? 'stop' : 'tray');
+      // Keep the existing renderer language preference when it is already set;
+      // newly installed app profiles can still seed it from Electron settings.
+      if (!window.localStorage.getItem('nexus.language') && settings.language) setLanguage(settings.language === 'en-US' ? 'en-US' : 'zh-CN');
+    };
+    if (!window.desktop?.getAppSettings) {
+      appSettingsHydratedRef.current = true;
+      return () => { alive = false; };
+    }
+    const unsubscribe = window.desktop.onAppSettingsChanged?.((settings) => {
+      if (alive) applyAppSettings(settings);
+    });
+    window.desktop.getAppSettings().then((settings) => {
+      if (!alive) return;
+      applyAppSettings(settings);
+      appSettingsHydratedRef.current = true;
+      // Sync the renderer's established language to the main process without
+      // overwriting it during the initial asynchronous read.
+      window.desktop.setAppSettings?.({ language });
+    }).catch(() => {
+      if (alive) appSettingsHydratedRef.current = true;
+    });
+    return () => {
+      alive = false;
+      unsubscribe?.();
+    };
+  }, []);
 
   useEffect(() => {
     window.localStorage.setItem('nexus.workflows', JSON.stringify(workflows));
@@ -581,17 +650,28 @@ function App() {
     return () => { alive = false; };
   }, []);
 
-  const applyBackendConfig = (payload, force = false) => {
+  const applyBackendConfig = (payload, force = false, expectedSyncEpoch = null) => {
     if (!payload?.config) return;
+    if (expectedSyncEpoch !== null && expectedSyncEpoch !== configSyncEpochRef.current) return false;
     if (!force && configDirtyRef.current) return;
+    const backendRevision = Number(payload.health?.configRevision) || 0;
+    if (!force && backendRevision && backendRevision < configBackendRevisionRef.current) return false;
     if (force) {
       configEditRevisionRef.current += 1;
       configDirtyRef.current = false;
     }
     const stamp = payload.health?.configStamp;
-    if (!force && stamp && stamp === configStampRef.current) return;
+    if (!force && stamp && stamp === configStampRef.current) return false;
     if (stamp) configStampRef.current = stamp;
+    if (backendRevision) configBackendRevisionRef.current = Math.max(configBackendRevisionRef.current, backendRevision);
     const nextGroups = hydrateGroups(payload.config.groups);
+    const nextServers = flattenGroups(nextGroups);
+    // A delete response can arrive while this page still holds the previously
+    // selected id. Never render one terminal's label while reconnecting the
+    // WebSocket to an already-deleted id; choose a persisted terminal first.
+    if (!nextServers.some((server) => server.id === activeServerId)) {
+      setActiveServerId(nextServers[0]?.id || '');
+    }
     if (Array.isArray(payload.config.groups)) setGroupsState(nextGroups);
     if (Array.isArray(payload.config.commands)) setCommandsState(payload.config.commands.map((command) => ({ ...command, runs: command.runs || 0, tone: command.tone || 'mint' })));
     if (Array.isArray(payload.config.workflows)) setWorkflowsState(payload.config.workflows);
@@ -606,6 +686,20 @@ function App() {
     }
     setBackendReady(true);
     setWsl((current) => ({ ...current, available: payload.health?.capabilities?.wsl ?? current.available, backend: true, distro: payload.health?.distro || current.distro }));
+    return true;
+  };
+
+  const enqueueConfigWrite = (payload, savingRevision) => {
+    const write = configWriteQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        // A later edit/delete already owns the canonical config.  Do not send
+        // this captured older React state after it.
+        if (savingRevision !== configEditRevisionRef.current) return null;
+        return backendRequest('/api/config', { method: 'PUT', body: payload });
+      });
+    configWriteQueueRef.current = write.catch(() => undefined);
+    return write;
   };
 
   const reloadBackendConfig = async (notify = true) => {
@@ -626,13 +720,14 @@ function App() {
     let alive = true;
     const load = () => {
       const requestedAtRevision = configEditRevisionRef.current;
+      const requestedAtSyncEpoch = configSyncEpochRef.current;
       return backendRequest('/api/config').then((payload) => {
         if (!alive) return;
         if (configDirtyRef.current) {
           setBackendReady(true);
           return;
         }
-        if (requestedAtRevision === configEditRevisionRef.current) applyBackendConfig(payload);
+        if (requestedAtRevision === configEditRevisionRef.current && requestedAtSyncEpoch === configSyncEpochRef.current) applyBackendConfig(payload, false, requestedAtSyncEpoch);
       });
     };
     const guardedLoad = () => load().catch(() => {
@@ -647,9 +742,11 @@ function App() {
     if (!backendReady) return undefined;
     const payload = { version: 1, groups, commands, workflows, schedules, settings: { logRetention: 'last-start' } };
     const savingRevision = configEditRevisionRef.current;
-    const timer = window.setTimeout(() => backendRequest('/api/config', { method: 'PUT', body: payload }).then((response) => {
+    const timer = window.setTimeout(() => enqueueConfigWrite(payload, savingRevision).then((response) => {
+      if (!response) return;
       if (savingRevision !== configEditRevisionRef.current) return;
       if (response.health?.configStamp) configStampRef.current = response.health.configStamp;
+      if (Number(response.health?.configRevision)) configBackendRevisionRef.current = Math.max(configBackendRevisionRef.current, Number(response.health.configRevision));
       configDirtyRef.current = false;
     }).catch(() => {
       if (savingRevision === configEditRevisionRef.current) setBackendReady(false);
@@ -743,7 +840,10 @@ function App() {
     if (!command) return;
     if (backendReady) {
       backendRequest('/api/commands/dispatch', { method: 'POST', body: { serverIds: [serverId], command }, timeout: 10000 }).then((response) => {
-        if (!response.ok) throw new Error('command dispatch failed');
+        if (!response.ok) {
+          const detail = (response.results || []).filter((result) => !result.ok).map((result) => result.error).filter(Boolean).join('; ');
+          throw new Error(detail || 'command dispatch failed');
+        }
         if (recordRun) recordCommandRun(command);
       }).catch((error) => showToast(`Command dispatch failed: ${error.message}`, 'warning'));
       setTerminalInput('');
@@ -860,7 +960,7 @@ function App() {
     }
   };
 
-  const queueTerminalPaste = (serverId, command) => {
+  const queueTerminalInput = (serverId, command, mode = 'paste') => {
     const target = servers.find((server) => server.id === serverId);
     if (!target) {
       showToast(language === 'zh-CN' ? '请选择一个目标终端' : 'Select one target terminal', 'warning');
@@ -868,8 +968,11 @@ function App() {
     }
     setActiveServerId(target.id);
     setActiveNav('terminal');
-    setTerminalPaste({ id: `paste-${Date.now()}`, serverId: target.id, command: String(command || '') });
+    setTerminalPaste({ id: `terminal-input-${Date.now()}`, serverId: target.id, command: String(command || ''), mode });
   };
+
+  const queueTerminalPaste = (serverId, command) => queueTerminalInput(serverId, command, 'paste');
+  const queueTerminalExecution = (serverId, command) => queueTerminalInput(serverId, command, 'execute');
 
   const pasteCommandFromLibrary = (item) => {
     if (selectedServers.length !== 1) {
@@ -1007,36 +1110,73 @@ function App() {
     const nextCommands = commands.filter((command) => command.id !== commandId);
     setCommands(nextCommands);
     if (backendReady) {
-      backendRequest('/api/config', {
-        method: 'PUT',
-        body: { version: 1, groups, commands: nextCommands, workflows, schedules, settings: { logRetention: 'last-start' } },
-      }).then((response) => {
+      const savingRevision = configEditRevisionRef.current;
+      enqueueConfigWrite({ version: 1, groups, commands: nextCommands, workflows, schedules, settings: { logRetention: 'last-start' } }, savingRevision).then((response) => {
+        if (!response || savingRevision !== configEditRevisionRef.current) return;
         if (response.health?.configStamp) configStampRef.current = response.health.configStamp;
+        if (Number(response.health?.configRevision)) configBackendRevisionRef.current = Math.max(configBackendRevisionRef.current, Number(response.health.configRevision));
+        configDirtyRef.current = false;
       }).catch((error) => showToast(`Command delete failed: ${error.message}`, 'warning'));
     }
     showToast(language === 'zh-CN' ? '指令已删除' : 'Command deleted');
   };
 
+  const restoreApplicationFocus = () => {
+    // Unlike a browser's synchronous confirm dialog, this in-app dialog never
+    // transfers native focus.  Ask Electron to foreground the window anyway
+    // after its closing animation, covering a click that landed on the modal
+    // backdrop while the delete request was completing.
+    window.requestAnimationFrame(() => {
+      window.focus();
+      void window.desktop?.focusMainWindow?.();
+    });
+  };
+
+  const requestServerRemoval = (server) => {
+    if (!server || serverBusy.has(server.id)) return;
+    setModal({ type: 'delete-server', server });
+  };
+
+  const closeDeleteServerModal = () => {
+    setModal(null);
+    restoreApplicationFocus();
+  };
+
+  const confirmServerRemoval = () => {
+    const server = modal?.type === 'delete-server' ? modal.server : null;
+    if (!server) return;
+    closeDeleteServerModal();
+    void removeServerRemote(server);
+  };
+
   const removeServerRemote = async (server) => {
     if (!server || serverBusy.has(server.id)) return;
-    const portText = server.port ? `\n端口：${server.port}` : '';
-    const sessionText = server.session ? `\ntmux 会话：${server.session}` : '';
-    const confirmed = window.confirm(`删除终端“${server.name}”将先停止服务、关闭 tmux 会话并释放配置端口。\n不会删除 WSL 工作目录或服务文件。${portText}${sessionText}\n\n确定继续吗？`);
-    if (!confirmed) return;
     setServerBusy((current) => new Set(current).add(server.id));
+    // Invalidate any already-returning config poll and cancel captured save
+    // timers before the destructive operation starts.  An in-flight save is
+    // awaited below, then deletion becomes the last writer.
+    const deleteSyncEpoch = configSyncEpochRef.current + 1;
+    configSyncEpochRef.current = deleteSyncEpoch;
+    configEditRevisionRef.current += 1;
+    configDirtyRef.current = true;
     try {
+      await configWriteQueueRef.current;
       const response = await backendRequest(`/api/servers/${encodeURIComponent(server.id)}`, { method: 'DELETE', timeout: 30000 });
-      applyBackendConfig(response, true);
-
-      // Re-read the persisted configuration so the list cannot be repopulated
-      // by a concurrent config poll or a stale in-memory snapshot.
+      // Accept the deletion response and one authoritative re-read while the
+      // poller remains fenced off.  This prevents a stale GET/PUT pair from
+      // bringing the removed item back into the current renderer.
+      applyBackendConfig(response, true, deleteSyncEpoch);
       const refreshed = await backendRequest('/api/config', { timeout: 10000 }).catch(() => response);
-      applyBackendConfig(refreshed, true);
+      applyBackendConfig(refreshed, true, deleteSyncEpoch);
       setSelectedIds((current) => { const next = new Set(current); next.delete(server.id); return next; });
       if (activeServerId === server.id) {
         const nextServer = flattenGroups(refreshed.config?.groups || []).find((item) => item.id !== server.id);
         setActiveServerId(nextServer?.id || '');
       }
+      // Reload the retained terminal's renderer and WebSocket after a server
+      // deletion.  This has no effect on its service/tmux session, but makes
+      // the post-delete UI deterministic instead of requiring Ctrl+R.
+      setTerminalReconnectEpoch((current) => current + 1);
       showToast(`已停止并删除终端 · ${server.name}`);
     } catch (error) {
       showToast(`删除失败，终端配置已保留: ${error.message}`, 'warning');
@@ -1057,13 +1197,13 @@ function App() {
 
   const renderPage = () => {
     if (!activeServer && activeNav === 'terminal') return <div className="empty-state panel"><Server size={28} /><strong>暂无服务配置</strong><span>创建一个终端后，可选择 WSL 工作目录或使用 /root。</span><button className="button primary" onClick={() => setModal({ type: 'server' })}><Plus size={15} />新建终端</button></div>;
-    if (activeNav === 'terminal') return <RealTerminalPage theme={theme} servers={servers} activeServer={activeServer} activeServerId={activeServerId} setActiveServerId={setActiveServerId} lines={activeLines} query={terminalQuery} setQuery={setTerminalQuery} onSend={sendCommand} commands={commands} onUseCommand={(item) => item.executionMode === 'paste' ? queueTerminalPaste(activeServer.id, item.command) : sendCommand(activeServer.id, item.command)} pendingPaste={terminalPaste?.serverId === activeServer.id ? terminalPaste : null} onPasteComplete={(requestId) => { setTerminalPaste((current) => current?.id === requestId ? null : current); showToast(language === 'zh-CN' ? '指令已粘贴到终端，请补充参数' : 'Command pasted; complete its parameters'); }} onAddService={() => setModal({ type: 'server' })} />;
+    if (activeNav === 'terminal') return <RealTerminalPage theme={theme} reconnectEpoch={terminalReconnectEpoch} servers={servers} activeServer={activeServer} activeServerId={activeServerId} setActiveServerId={setActiveServerId} query={terminalQuery} setQuery={setTerminalQuery} onSend={sendCommand} commands={commands} onUseCommand={(item) => item.executionMode === 'paste' ? queueTerminalPaste(activeServer.id, item.command) : queueTerminalExecution(activeServer.id, item.command)} pendingPaste={terminalPaste?.serverId === activeServer.id ? terminalPaste : null} onPasteComplete={(request) => { setTerminalPaste((current) => current?.id === request.id ? null : current); if (request.mode === 'execute') { recordCommandRun(request.command); showToast(language === 'zh-CN' ? '指令已发送到当前终端' : 'Command sent to the current terminal'); } else showToast(language === 'zh-CN' ? '指令已粘贴到终端，请补充参数' : 'Command pasted; complete its parameters'); }} onAddService={() => setModal({ type: 'server' })} />;
     if (activeNav === 'logs') return <LogsPage servers={servers} linesByServer={linesByServer} query={logQuery} setQuery={setLogQuery} onOpen={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} onOpenDirectory={() => { if (window.desktop?.openLogDirectory) window.desktop.openLogDirectory(); else showToast('请在 Electron 应用中打开日志目录', 'warning'); }} onOpenLogFile={(id) => { if (window.desktop?.openLogFile) window.desktop.openLogFile(id); else showToast('请在 Electron 应用中打开日志文件', 'warning'); }} backendReady={backendReady} />;
     if (activeNav === 'commands') return <CommandsPage language={language} commands={filteredCommands} query={commandQuery} setQuery={setCommandQuery} groups={groups} selectedIds={selectedIds} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onClearSelection={() => setSelectedIds(new Set())} onRun={sendToSelectedRemote} onPaste={pasteCommandFromLibrary} onModeChange={updateCommandMode} onNew={() => setModal({ type: 'command' })} onImport={importCommandLibrary} onExport={exportCommandLibrary} onCopy={copyCommand} onEdit={(item) => setModal({ type: 'command', command: item })} onDelete={deleteCommand} />;
     if (activeNav === 'orchestration') return <OrchestrationPage language={language} workflows={workflows} schedules={schedules} servers={servers} commands={commands.filter((command) => command.executionMode !== 'paste')} backendReady={backendReady} onWorkflowsChange={setWorkflows} onSchedulesChange={setSchedules} onRun={(id) => backendRequest(`/api/workflows/${encodeURIComponent(id)}/run`, { method: 'POST' }).then((run) => { showToast(language === 'zh-CN' ? '编排已开始' : 'Workflow started'); return run; }).catch((error) => { showToast(`${language === 'zh-CN' ? '编排启动失败' : 'Workflow failed to start'}: ${error.message}`, 'warning'); throw error; })} />;
     if (activeNav === 'overview') return <OverviewPage groups={groups} servers={servers} statusCounts={statusCounts} wsl={wsl} backendHealth={backendHealth} onOpenServiceManagement={() => setActiveNav('fleet')} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} />;
-    if (activeNav === 'fleet') return <ServiceManagementPage groups={groups} servers={servers} selectedIds={selectedIds} collapsedGroups={collapsedGroups} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onCollapse={toggleCollapsed} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} onAction={runActionRemote} onRemove={removeServerRemote} selectedServers={selectedServers} statusCounts={statusCounts} onSend={sendToSelectedRemote} onClearSelection={() => setSelectedIds(new Set())} onAddGroup={() => setModal({ type: 'group' })} onAddService={() => setModal({ type: 'server' })} onOpenOrchestration={() => setActiveNav('orchestration')} />;
-    if (activeNav === 'settings') return <SettingsPage language={language} theme={theme} backendReady={backendReady} backendHealth={backendHealth} wsl={wsl} onLanguageChange={setLanguage} onThemeChange={setTheme} onReloadConfig={() => reloadBackendConfig()} onRuntimeHealth={(health) => { if (!health) return; setBackendHealth(health); setWsl((current) => ({ ...current, available: health.capabilities?.wsl ?? current.available, backend: true, distro: health.distro || current.distro })); }} onNotify={showToast} />;
+    if (activeNav === 'fleet') return <ServiceManagementPage groups={groups} servers={servers} selectedIds={selectedIds} collapsedGroups={collapsedGroups} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onCollapse={toggleCollapsed} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} onAction={runActionRemote} onRemove={requestServerRemoval} selectedServers={selectedServers} statusCounts={statusCounts} onSend={sendToSelectedRemote} onClearSelection={() => setSelectedIds(new Set())} onAddGroup={() => setModal({ type: 'group' })} onAddService={() => setModal({ type: 'server' })} onOpenOrchestration={() => setActiveNav('orchestration')} />;
+    if (activeNav === 'settings') return <SettingsPage language={language} theme={theme} closePromptDisabled={closePromptDisabled} closeBehavior={closeBehavior} backendReady={backendReady} backendHealth={backendHealth} wsl={wsl} onLanguageChange={setLanguage} onThemeChange={setTheme} onClosePromptChange={setClosePromptDisabled} onCloseBehaviorChange={setCloseBehavior} onReloadConfig={() => reloadBackendConfig()} onRuntimeHealth={(health) => { if (!health) return; setBackendHealth(health); setWsl((current) => ({ ...current, available: health.capabilities?.wsl ?? current.available, backend: true, distro: health.distro || current.distro })); }} onNotify={showToast} />;
     return <OverviewPage groups={groups} servers={servers} statusCounts={statusCounts} wsl={wsl} backendHealth={backendHealth} onOpenServiceManagement={() => setActiveNav('fleet')} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} />;
   };
 
@@ -1122,13 +1262,56 @@ function App() {
         <div className={`content-scroll ${activeNav === 'terminal' ? 'content-scroll-terminal' : ''}`}>{renderPage()}</div>
       </main>
       {toast && <div className={`toast toast-${toast.tone}`}><CheckCircle2 size={17} />{toast.message}<button onClick={() => setToast(null)}><X size={14} /></button></div>}
-      {modal && <CreationModal key={`${modal.type}-${modal.command?.id || 'new'}`} language={language} type={modal.type} groups={groups} wsl={wsl} terminalProfiles={terminalProfiles} initialCommand={modal.command} onClose={() => setModal(null)} onCreate={modal.type === 'group' ? createGroup : modal.type === 'server' ? createServer : (form) => saveCommand(form, modal.command)} />}
+      {modal?.type === 'delete-server'
+        ? <DeleteServerModal language={language} server={modal.server} busy={serverBusy.has(modal.server?.id)} onCancel={closeDeleteServerModal} onConfirm={confirmServerRemoval} />
+        : modal && <CreationModal key={`${modal.type}-${modal.command?.id || 'new'}`} language={language} type={modal.type} groups={groups} wsl={wsl} terminalProfiles={terminalProfiles} initialCommand={modal.command} onClose={() => setModal(null)} onCreate={modal.type === 'group' ? createGroup : modal.type === 'server' ? createServer : (form) => saveCommand(form, modal.command)} />}
     </div>
   );
 }
 
 function PageIntro({ eyebrow, title, description, actions }) {
   return <div className="page-intro"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{actions && <div className="intro-actions">{actions}</div>}</div>;
+}
+
+function DeleteServerModal({ language = 'zh-CN', server, busy, onCancel, onConfirm }) {
+  const confirmRef = useRef(null);
+  const isZh = language === 'zh-CN';
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => confirmRef.current?.focus());
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape' && !busy) {
+        event.preventDefault();
+        onCancel?.();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [busy, onCancel]);
+  if (!server) return null;
+  const details = [
+    server.port ? `${isZh ? '端口' : 'Port'}: ${server.port}` : '',
+    server.session ? `tmux: ${server.session}` : '',
+  ].filter(Boolean);
+  return <div className="modal-backdrop delete-server-backdrop" role="presentation">
+    <section className="creation-modal delete-server-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-server-title" aria-describedby="delete-server-description">
+      <div className="modal-header">
+        <div><div className="eyebrow">{isZh ? '终端管理' : 'TERMINAL MANAGEMENT'}</div><h2 id="delete-server-title">{isZh ? '删除终端？' : 'Delete terminal?'}</h2></div>
+        <AlertTriangle className="delete-server-icon" size={21} aria-hidden="true" />
+      </div>
+      <div className="delete-server-content" id="delete-server-description">
+        <p>{isZh ? <>将停止 <strong>{server.name}</strong> 的服务、关闭 tmux 会话并释放已配置端口。</> : <>This stops <strong>{server.name}</strong>, closes its tmux session, and releases its configured port.</>}</p>
+        {details.length > 0 && <code>{details.join(' · ')}</code>}
+        <p className="delete-server-note">{isZh ? '不会删除 WSL 工作目录或其中的服务文件。' : 'The WSL working directory and service files are not deleted.'}</p>
+      </div>
+      <div className="modal-footer">
+        <button className="button secondary" type="button" onClick={onCancel} disabled={busy}>{isZh ? '取消' : 'Cancel'}</button>
+        <button className="button danger-button" type="button" ref={confirmRef} onClick={onConfirm} disabled={busy}><Trash2 size={15} />{busy ? (isZh ? '正在删除…' : 'Deleting…') : (isZh ? '停止并删除' : 'Stop and delete')}</button>
+      </div>
+    </section>
+  </div>;
 }
 
 function OverviewPage({ groups, servers, statusCounts, wsl, backendHealth, onOpenServiceManagement, onSelectServer }) {
@@ -1225,7 +1408,7 @@ function ServiceManagementPage({ groups, servers, selectedIds, collapsedGroups, 
   </>;
 }
 
-function SettingsPage({ language, theme, backendReady, backendHealth, wsl, onLanguageChange, onThemeChange, onReloadConfig, onRuntimeHealth, onNotify }) {
+function SettingsPage({ language, theme, closePromptDisabled, closeBehavior, backendReady, backendHealth, wsl, onLanguageChange, onThemeChange, onClosePromptChange, onCloseBehaviorChange, onReloadConfig, onRuntimeHealth, onNotify }) {
   const isZh = language === 'zh-CN';
   const fixedPath = 'backend/servers.json';
   const [installingTmux, setInstallingTmux] = useState(false);
@@ -1274,6 +1457,24 @@ function SettingsPage({ language, theme, backendReady, backendHealth, wsl, onLan
             <div className="theme-setting-copy"><strong>{theme === 'light' ? (isZh ? '浅色模式' : 'Light mode') : (isZh ? '深色模式' : 'Dark mode')}</strong><span>{isZh ? '主题设置仅保存在当前电脑。' : 'The theme preference is stored on this computer.'}</span></div>
             <button type="button" className={`theme-switch ${theme === 'light' ? 'on' : ''}`} role="switch" aria-checked={theme === 'light'} aria-label={isZh ? '开启浅色模式' : 'Enable light mode'} onClick={() => onThemeChange(theme === 'light' ? 'dark' : 'light')}><span /></button>
           </div>
+        </div>
+      </section>
+
+      <section className="settings-section settings-wide panel settings-close-behavior">
+        <div className="panel-heading"><div><h3>{isZh ? '关闭客户端' : 'Close behavior'}</h3><span>{isZh ? '选择关闭窗口时是否确认，以及免提醒时的默认动作。' : 'Choose whether closing asks for confirmation and what the default action should be.'}</span></div><Power size={18} className="panel-heading-icon" /></div>
+        <div className="settings-fields">
+          <label className="settings-checkbox-row">
+            <input type="checkbox" checked={closePromptDisabled === true} onChange={(event) => onClosePromptChange?.(event.target.checked)} />
+            <span><strong>{isZh ? '下次不再提醒' : 'Do not ask again'}</strong><small>{isZh ? '关闭窗口时直接执行下面选择的默认动作。' : 'Closing the window will immediately use the default action below.'}</small></span>
+          </label>
+          <div className="close-behavior-picker">
+            <label htmlFor="close-behavior-select">{isZh ? '免提醒时的默认动作' : 'Default action when reminders are disabled'}</label>
+            <select id="close-behavior-select" value={closeBehavior === 'stop' ? 'stop' : 'tray'} onChange={(event) => onCloseBehaviorChange?.(event.target.value)}>
+              <option value="tray">{isZh ? '最小化到托盘（保留服务运行）' : 'Minimize to tray (keep services running)'}</option>
+              <option value="stop">{isZh ? '关闭服务并关闭客户端' : 'Stop services and quit'}</option>
+            </select>
+          </div>
+          <span className="field-hint">{isZh ? '关闭服务会发送每个终端配置的停止指令，并停止本地调度后端；不会删除终端配置。最小化到托盘后可从系统托盘恢复窗口。' : 'Stopping sends each terminal\'s configured stop command and stops the local scheduler without deleting configuration. A minimized app can be restored from the system tray.'}</span>
         </div>
       </section>
 
@@ -1371,11 +1572,14 @@ function TerminalPage({ servers, activeServer, activeServerId, setActiveServerId
   </>;
 }
 
-function RealTerminalPage({ theme, servers, activeServer, activeServerId, setActiveServerId, lines, query, setQuery, onSend, commands, onUseCommand, pendingPaste, onPasteComplete, onAddService }) {
+function RealTerminalPage({ theme, reconnectEpoch, servers, activeServer, activeServerId, setActiveServerId, query, setQuery, onSend, commands, onUseCommand, pendingPaste, onPasteComplete, onAddService }) {
+  const focusActiveTerminal = () => window.dispatchEvent(new CustomEvent('nexus:focus-terminal', {
+    detail: { serverId: activeServer.id },
+  }));
   return <>
     <div className="terminal-new-service"><button className="button secondary" onClick={onAddService}><Plus size={15} />New terminal</button></div>
-    <PageIntro eyebrow="INTERACTIVE SHELL" title="终端" description={`连接到 ${shellLabel(activeServer.shell)} 的真实 PTY 会话，实时查看输出并输入命令。`} actions={<><button className="button secondary" onClick={() => navigator.clipboard?.writeText(`nexus://local/${activeServer.id}`)}><Copy size={16} />复制会话地址</button><button className="button primary" onClick={() => document.querySelector('.xterm-helper-textarea')?.focus()}><Terminal size={16} />激活终端输入</button></>} />
-    <div className="terminal-layout"><div className="terminal-sidebar panel"><div className="terminal-sidebar-heading"><span>ACTIVE SESSIONS</span><button className="icon-button compact" onClick={onAddService} title="New terminal" aria-label="New terminal"><Plus size={15} /></button></div><div className="terminal-session-list">{servers.map((server) => <button key={server.id} className={`terminal-session ${activeServerId === server.id ? 'active' : ''}`} onClick={() => setActiveServerId(server.id)}><span className={`session-dot ${server.status}`} /><span className="session-name"><strong>{server.name}</strong><small>{server.groupName} · {shellLabel(server.shell)}</small></span><span className="session-state">{server.status === 'running' ? 'live' : statusMeta[server.status].label}</span></button>)}</div><TerminalCommandBar commands={commands} onUse={onUseCommand} /></div><XTermPanel key={activeServer.id} theme={theme} server={activeServer} lines={lines} query={query} setQuery={setQuery} onSend={onSend} pendingPaste={pendingPaste} onPasteComplete={onPasteComplete} /></div>
+    <PageIntro eyebrow="INTERACTIVE SHELL" title="终端" description={`连接到 ${shellLabel(activeServer.shell)} 的真实 PTY 会话，实时查看输出并输入命令。`} actions={<><button className="button secondary" onClick={() => navigator.clipboard?.writeText(`nexus://local/${activeServer.id}`)}><Copy size={16} />复制会话地址</button><button className="button primary" onClick={focusActiveTerminal}><Terminal size={16} />激活终端输入</button></>} />
+    <div className="terminal-layout"><div className="terminal-sidebar panel"><div className="terminal-sidebar-heading"><span>ACTIVE SESSIONS</span><button className="icon-button compact" onClick={onAddService} title="New terminal" aria-label="New terminal"><Plus size={15} /></button></div><div className="terminal-session-list">{servers.map((server) => <button key={server.id} className={`terminal-session ${activeServerId === server.id ? 'active' : ''}`} onClick={() => setActiveServerId(server.id)}><span className={`session-dot ${server.status}`} /><span className="session-name"><strong>{server.name}</strong><small>{server.groupName} · {shellLabel(server.shell)}</small></span><span className="session-state">{server.status === 'running' ? 'live' : statusMeta[server.status].label}</span></button>)}</div><TerminalCommandBar commands={commands} onUse={onUseCommand} /></div><XTermPanel key={`${activeServer.id}:${reconnectEpoch}`} theme={theme} server={activeServer} query={query} setQuery={setQuery} onSend={onSend} pendingPaste={pendingPaste} onPasteComplete={onPasteComplete} /></div>
   </>;
 }
 
@@ -1386,7 +1590,7 @@ function TerminalCommandBar({ commands, onUse }) {
   return <div className="terminal-command-bar panel"><div><strong>当前终端指令库</strong><span>执行型附加回车，粘贴型等待补充参数</span></div><div className="terminal-command-picker"><button className="button secondary" onClick={() => setOpen((value) => !value)}><Command size={15} />选择指令<ChevronDown size={14} /></button>{open && <div className="terminal-command-menu"><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索指令" />{filtered.map((item) => { const paste = item.executionMode === 'paste'; return <button key={item.id} onClick={() => { onUse?.(item); setOpen(false); setQuery(''); }}><span><strong>{item.name}</strong><code>{item.command}</code><small>{paste ? '粘贴后补参数' : '直接执行'}</small></span>{paste ? <ClipboardPaste size={13} /> : <Play size={13} />}</button>; })}{!filtered.length && <span className="terminal-command-empty">没有匹配的指令</span>}</div>}</div></div>;
 }
 
-function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPaste, onPasteComplete }) {
+function XTermPanel({ theme, server, query, setQuery, onSend, pendingPaste, onPasteComplete }) {
   const hostRef = useRef(null);
   const terminalRef = useRef(null);
   const searchRef = useRef(null);
@@ -1413,7 +1617,9 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
        // WSL `dircolors` uses background styles such as 34;42 for writable
        // directories. Use a strong ratio so those labels remain readable.
        minimumContrastRatio: 7,
-      scrollback: 5000,
+      // Keep a useful amount of scrollback for output produced during this
+      // attachment. A tmux rebind also restores recent history into it.
+      scrollback: 10000,
       theme: terminalPalette(theme),
     });
     const fit = new FitAddon();
@@ -1423,6 +1629,43 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
     terminal.open(hostRef.current);
     terminalRef.current = terminal;
     searchRef.current = search;
+
+    let disposed = false;
+    let focusFrame = 0;
+    const focusTimers = new Set();
+    const hasTerminalFocus = () => Boolean(hostRef.current?.contains(document.activeElement));
+    const focusTerminal = () => {
+      window.cancelAnimationFrame(focusFrame);
+      const applyFocus = () => {
+        focusFrame = 0;
+        if (disposed || !hostRef.current?.isConnected) return;
+        // terminal.focus() is the xterm API, while the explicit textarea
+        // fallback covers Electron's remount timing where xterm has created
+        // its helper input a frame later than the terminal canvas.
+        terminal.focus();
+        const input = hostRef.current.querySelector('.xterm-helper-textarea');
+        if (input && document.activeElement !== input) input.focus({ preventScroll: true });
+      };
+      applyFocus();
+      focusFrame = window.requestAnimationFrame(applyFocus);
+      [80, 240].forEach((delay) => {
+        const timer = window.setTimeout(() => {
+          focusTimers.delete(timer);
+          applyFocus();
+        }, delay);
+        focusTimers.add(timer);
+      });
+    };
+    const focusRequested = (event) => {
+      if (event.detail?.serverId && event.detail.serverId !== server.id) return;
+      focusTerminal();
+    };
+    const focusOnPointerDown = () => focusTerminal();
+    window.addEventListener('nexus:focus-terminal', focusRequested);
+    hostRef.current.addEventListener('pointerdown', focusOnPointerDown);
+    // Sidebar navigation buttons retain browser focus by default. When this
+    // page mounts, hand focus to xterm so Space and Enter reach the PTY.
+    focusTerminal();
 
     const copySelection = async () => {
       const value = terminal.getSelection();
@@ -1436,32 +1679,74 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
         setCopyState('failed');
       }
     };
+    const pasteClipboard = async () => {
+      try {
+        const value = window.desktop?.readClipboardText
+          ? await window.desktop.readClipboardText()
+          : await navigator.clipboard?.readText();
+        if (!value) return;
+        terminal.paste(value);
+        terminal.focus();
+        setCopyState('pasted');
+        window.setTimeout(() => setCopyState(''), 1200);
+      } catch {
+        setCopyState('paste-failed');
+      }
+    };
     terminal.attachCustomKeyEventHandler((event) => {
-      if (event.type === 'keydown' && event.shiftKey && (event.ctrlKey || event.metaKey) && event.code === 'KeyC') {
+      if (event.type !== 'keydown') return true;
+      if (event.shiftKey && (event.ctrlKey || event.metaKey) && event.code === 'KeyC') {
+        event.preventDefault();
         void copySelection();
+        return false;
+      }
+      const modifierPaste = (event.ctrlKey || event.metaKey) && event.code === 'KeyV';
+      const insertPaste = event.shiftKey && !event.ctrlKey && !event.metaKey && event.code === 'Insert';
+      if ((modifierPaste || insertPaste) && (window.desktop?.readClipboardText || navigator.clipboard?.readText)) {
+        event.preventDefault();
+        void pasteClipboard();
         return false;
       }
       return true;
     });
     const selectionChange = terminal.onSelectionChange(() => setSelectionAvailable(terminal.hasSelection()));
     const onContextMenu = (event) => {
-      if (!terminal.hasSelection()) return;
-      event.preventDefault();
-      void copySelection();
+      if (terminal.hasSelection()) {
+        event.preventDefault();
+        void copySelection();
+        return;
+      }
+      if (window.desktop?.readClipboardText || navigator.clipboard?.readText) {
+        event.preventDefault();
+        void pasteClipboard();
+      }
     };
     hostRef.current.addEventListener('contextmenu', onContextMenu);
 
     const fallback = fallbackRef.current;
+    const previewShownRef = { current: false };
+    const hasConnectedRef = { current: false };
     const writePrompt = () => {
       const shell = normalizeShellType(server.shell);
       if (shell === 'powershell' || shell === 'pwsh') terminal.write(`\x1b[38;2;128;173;255mPS\x1b[0m ${server.dir || '~'}> `);
       else if (shell === 'cmd') terminal.write(`${server.dir || 'C:\\'}> `);
       else terminal.write('\x1b[38;2;117;216;189mnexus\x1b[0m@\x1b[38;2;128;173;255mubuntu\x1b[0m:\x1b[38;2;243;199;120m~\x1b[0m$ ');
     };
-    terminal.writeln(`\x1b[38;2;94;115;126mNexus PTY preview · ${server.name} · ${shellLabel(server.shell)}\x1b[0m`);
-    terminal.writeln('\x1b[38;2;94;115;126mPTY backend offline; preview shell active.\x1b[0m');
-    lines.slice(-80).forEach((line) => terminal.writeln(line));
-    writePrompt();
+    const showPreview = () => {
+      if (previewShownRef.current) return;
+      previewShownRef.current = true;
+      const restoreFocus = hasTerminalFocus();
+      terminal.reset();
+      terminal.writeln(`\x1b[38;2;94;115;126mNexus PTY preview · ${server.name} · ${shellLabel(server.shell)}\x1b[0m`);
+      terminal.writeln('\x1b[38;2;94;115;126mPTY backend offline; preview shell active.\x1b[0m');
+      terminal.writeln('\x1b[38;2;94;115;126mNo previous output loaded; open Logs to search history.\x1b[0m');
+      writePrompt();
+      if (restoreFocus) focusTerminal();
+    };
+    // Historical output is intentionally omitted here. It remains available
+    // through the Logs page instead of being replayed into a fresh session.
+    // Keep the canvas empty until either the backend restores the real pane or
+    // the offline preview explicitly supplies its own prompt.
 
     const redrawPrompt = () => { terminal.write('\r\x1b[2K'); writePrompt(); terminal.write(fallback.buffer); };
     const complete = () => {
@@ -1504,48 +1789,78 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
         return;
       }
       if (data === '\t') { complete(); return; }
-      if (data === '\r') { executeFallback(fallback.buffer); return; }
-      if (data === '\u0003') { terminal.write('^C\r\n'); fallback.buffer = ''; writePrompt(); return; }
-      if (data === '\u007f') { if (fallback.buffer.length) { fallback.buffer = fallback.buffer.slice(0, -1); terminal.write('\b \b'); } return; }
       if (data === '\u001b[A') { if (fallback.history.length) { fallback.historyIndex = Math.min(fallback.historyIndex + 1, fallback.history.length - 1); fallback.buffer = fallback.history[fallback.historyIndex] || ''; redrawPrompt(); } return; }
       if (data === '\u001b[B') { fallback.historyIndex = Math.max(fallback.historyIndex - 1, -1); fallback.buffer = fallback.historyIndex < 0 ? '' : fallback.history[fallback.historyIndex]; redrawPrompt(); return; }
-      if (data >= ' ' && data !== '\u007f') { fallback.buffer += data; terminal.write(data); }
+      for (const character of data) {
+        if (character === '\r') { executeFallback(fallback.buffer); continue; }
+        if (character === '\n') continue;
+        if (character === '\u0003') { terminal.write('^C\r\n'); fallback.buffer = ''; writePrompt(); continue; }
+        if (character === '\u007f') {
+          if (fallback.buffer.length) { fallback.buffer = fallback.buffer.slice(0, -1); terminal.write('\b \b'); }
+          continue;
+        }
+        if (character === '\t') { fallback.buffer += character; terminal.write(character); continue; }
+        if (character >= ' ') { fallback.buffer += character; terminal.write(character); }
+      }
     });
+    const terminalKeyFromBrowserEvent = (event) => {
+      if (event.ctrlKey || event.metaKey) {
+        if (event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'c') return '\u0003';
+        if (event.ctrlKey && !event.metaKey && event.key.toLowerCase() === 'd') return '\u0004';
+        return '';
+      }
+      if (event.altKey || event.isComposing) return '';
+      const special = {
+        Enter: '\r',
+        Tab: '\t',
+        Backspace: '\u007f',
+        Escape: '\u001b',
+        ArrowUp: '\u001b[A',
+        ArrowDown: '\u001b[B',
+        ArrowRight: '\u001b[C',
+        ArrowLeft: '\u001b[D',
+        Delete: '\u001b[3~',
+        Home: '\u001b[H',
+        End: '\u001b[F',
+      };
+      return special[event.key] || (event.key.length === 1 ? event.key : '');
+    };
+    const onWindowKeyDown = (event) => {
+      if (event.defaultPrevented || hasTerminalFocus()) return;
+      const target = event.target;
+      // Do not steal keys from the terminal search, command picker, modal
+      // forms, or any other deliberate text-editing control.
+      if (target instanceof Element && target.closest('input, textarea, select, [contenteditable="true"]')) return;
+      const data = terminalKeyFromBrowserEvent(event);
+      if (!data) return;
+      event.preventDefault();
+      event.stopPropagation();
+      // paste() enters xterm through the same onData path as real keyboard
+      // input, so it preserves the WebSocket/PTY protocol and offline preview.
+      terminal.paste(data);
+      focusTerminal();
+    };
+    window.addEventListener('keydown', onWindowKeyDown);
 
-    const socketUrl = socketUrlFor(server.id);
-    let disposed = false;
+    // Fit before opening the socket so a new tmux client is created with the
+    // same dimensions as xterm. A follow-up resize is then only needed after
+    // an actual window resize, avoiding the delayed full-screen repaint on
+    // tmux 2.x.
+    fit.fit();
     let reconnectTimer = 0;
     let reconnectAttempt = 0;
     let resizeFrame = 0;
     let initialResizeTimer = 0;
+    let handshakeResizeTimer = 0;
+    let handshakeReceived = false;
+    let backendSize = '';
     let lastSentSize = '';
-    /* legacy one-shot connection kept below for reference
-    try {
-      const socket = new WebSocket(socketUrl);
-      socketRef.current = socket;
-      socket.onopen = () => {
-        fallback.connected = true;
-        setConnection('connected');
-        terminal.write('\r\n\x1b[38;2;117;216;189m✓ PTY connected · WSL Ubuntu\x1b[0m\r\n');
-        socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }));
-      };
-      socket.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-          if (message.type === 'output') terminal.write(message.data);
-          if (message.type === 'status') setConnection(message.value);
-        } catch { terminal.write(event.data); }
-      };
-      socket.onclose = () => { fallback.connected = false; setConnection('preview'); };
-      socket.onerror = () => { fallback.connected = false; setConnection('preview'); };
-    } catch { setConnection('preview'); }
-    */
     const sendResize = (force = false) => {
       if (disposed) return;
       fit.fit();
       const size = `${terminal.cols}x${terminal.rows}`;
       const socket = socketRef.current;
-      if (socket?.readyState !== WebSocket.OPEN || (!force && size === lastSentSize)) return;
+      if (socket?.readyState !== WebSocket.OPEN || !handshakeReceived || (!force && size === lastSentSize)) return;
       socket.send(JSON.stringify({ type: 'resize', cols: terminal.cols, rows: terminal.rows }));
       lastSentSize = size;
     };
@@ -1553,7 +1868,13 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
       if (disposed) return;
       setConnection('connecting');
       let socket;
-      try { socket = new WebSocket(socketUrl); } catch { setConnection('preview'); return; }
+      const socketUrl = socketUrlFor(server.id, { cols: terminal.cols, rows: terminal.rows });
+      try { socket = new WebSocket(socketUrl); } catch {
+        fallback.connected = false;
+        setConnection('preview');
+        showPreview();
+        return;
+      }
       socketRef.current = socket;
       socket.onopen = () => {
         if (disposed || socketRef.current !== socket) {
@@ -1562,30 +1883,103 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
         }
         reconnectAttempt = 0;
         lastSentSize = '';
+        handshakeReceived = false;
+        backendSize = '';
         fallback.connected = true;
+        hasConnectedRef.current = true;
         setTerminalReady(false);
-        setConnection('connected');
-        terminal.write(`\r\n\x1b[38;2;117;216;189mPTY connected - ${shellLabel(server.shell)}\x1b[0m\r\n`);
-        sendResize(true);
+        // Keep the status as connecting until the backend handshake arrives.
+        // This avoids presenting a ready terminal while tmux is still syncing
+        // its retained pane into the PTY.
+        setConnection('connecting');
+        const wasPreview = previewShownRef.current;
+        previewShownRef.current = false;
+        // Keep the current canvas while a real PTY reconnects. The backend
+        // sends a replacement snapshot when it has one, so clearing here only
+        // creates a visible blank interval and hides the retained tmux screen.
+        if (wasPreview) {
+          const restoreFocus = hasTerminalFocus();
+          terminal.reset();
+          if (restoreFocus) focusTerminal();
+        }
+        // A reused tmux PTY may not emit a prompt when a new tab attaches.
+        // The backend restores the real pane (including its cursor) instead
+        // of drawing a synthetic prompt that would briefly mask the snapshot.
+        // Wait for the backend handshake before resizing.  On a renderer
+        // rebind the PTY already has the correct dimensions; an eager resize
+        // makes tmux repaint its entire old pane and causes the visible delay
+        // that used to look like a stuck connection banner.
+        window.clearTimeout(handshakeResizeTimer);
+        handshakeResizeTimer = window.setTimeout(() => {
+          if (!handshakeReceived) sendResize(true);
+          handshakeResizeTimer = 0;
+        }, 250);
       };
       socket.onmessage = (event) => {
         if (disposed || socketRef.current !== socket) return;
         try {
           const message = JSON.parse(event.data);
+          if (message.type === 'reset') {
+            // Renderer rebinds use this to replace only xterm's local buffer;
+            // tmux, the service process, and the log file remain untouched.
+            const restoreFocus = hasTerminalFocus();
+            terminal.reset();
+            // Keep compatibility with an older backend that still emits a
+            // fresh-attachment reset when no pane bytes are available.
+            if (message.reason === 'fresh-attachment') writePrompt();
+            setConnection('connected');
+            setTerminalReady(true);
+            if (restoreFocus) focusTerminal();
+            return;
+          }
           if (message.type === 'output') {
-            if (message.replay) terminal.reset();
-            terminal.write(message.data);
+            // Older backends may still send a persisted replay frame. A fresh
+            // terminal deliberately ignores it; history is read from Logs.
+            if (message.replay) return;
+            if (message.snapshot) {
+              // A same-process tab switch can restore the live PTY canvas.
+              // Reset the local prompt first so the snapshot is not appended
+              // below it. This is never sent after an app restart.
+              const restoreFocus = hasTerminalFocus();
+              terminal.reset();
+              if (restoreFocus) focusTerminal();
+            }
+            terminal.write(removeLegacyPtyBanner(message.data));
             setTerminalReady(true);
           }
-          if (message.type === 'status' && message.value !== 'connected') setConnection(message.value);
-        } catch { terminal.write(event.data); }
+          if (message.type === 'status') {
+            if (message.value !== 'connected') setConnection(message.value);
+            if (message.value === 'connected') {
+              setConnection(message.syncing ? 'connecting' : 'connected');
+              handshakeReceived = true;
+              window.clearTimeout(handshakeResizeTimer);
+              handshakeResizeTimer = 0;
+              backendSize = Number(message.cols) > 0 && Number(message.rows) > 0
+                ? `${Number(message.cols)}x${Number(message.rows)}`
+                : '';
+              fit.fit();
+              const currentSize = `${terminal.cols}x${terminal.rows}`;
+              // Fresh attachments need one resize after the PTY exists.  A
+              // rebind with unchanged dimensions must not send one: tmux 2.x
+              // treats it as a repaint request and streams the old snapshot.
+              if (!backendSize || backendSize !== currentSize) sendResize(true);
+              else lastSentSize = currentSize;
+              setTerminalReady(!message.syncing);
+            }
+          }
+        } catch { terminal.write(removeLegacyPtyBanner(event.data)); }
       };
       socket.onclose = (event) => {
         if (disposed || socketRef.current !== socket) return;
         socketRef.current = null;
         fallback.connected = false;
+        handshakeReceived = false;
+        backendSize = '';
+        window.clearTimeout(handshakeResizeTimer);
+        handshakeResizeTimer = 0;
         setTerminalReady(false);
         setConnection('preview');
+        if (!hasConnectedRef.current) showPreview();
         // A newer Nexus terminal intentionally took ownership of this service.
         // Retrying here would make both renderers continuously detach each other.
         if (event.code === 4001) return;
@@ -1596,10 +1990,9 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
       socket.onerror = () => {
         if (disposed || socketRef.current !== socket) return;
         fallback.connected = false;
+        if (!hasConnectedRef.current) showPreview();
       };
     };
-    openSocket();
-
     const resize = () => {
       window.cancelAnimationFrame(resizeFrame);
       resizeFrame = window.requestAnimationFrame(() => sendResize());
@@ -1607,16 +2000,30 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
     const resizeObserver = new ResizeObserver(resize);
     resizeObserver.observe(hostRef.current);
     window.addEventListener('resize', resize);
-    initialResizeTimer = window.setTimeout(resize, 0);
+    // React StrictMode mounts effects twice in development. Deferring the
+    // socket by one frame lets the throwaway mount clean up first and gives the
+    // terminal host its final dimensions before they enter the handshake URL.
+    initialResizeTimer = window.setTimeout(() => {
+      fit.fit();
+      openSocket();
+      resize();
+    }, 0);
     return () => {
       disposed = true;
       fallback.connected = false;
       window.clearTimeout(reconnectTimer);
       window.clearTimeout(initialResizeTimer);
+      window.clearTimeout(handshakeResizeTimer);
+      focusTimers.forEach((timer) => window.clearTimeout(timer));
+      focusTimers.clear();
+      window.cancelAnimationFrame(focusFrame);
       window.cancelAnimationFrame(resizeFrame);
       resizeObserver.disconnect();
       window.removeEventListener('resize', resize);
+      window.removeEventListener('keydown', onWindowKeyDown);
+      window.removeEventListener('nexus:focus-terminal', focusRequested);
       hostRef.current?.removeEventListener('contextmenu', onContextMenu);
+      hostRef.current?.removeEventListener('pointerdown', focusOnPointerDown);
       selectionChange.dispose();
       onData.dispose();
       const socket = socketRef.current;
@@ -1642,9 +2049,15 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
     const socket = socketRef.current;
     if (socket?.readyState !== WebSocket.OPEN) return;
     lastPastedIdRef.current = pendingPaste.id;
-    socket.send(JSON.stringify({ type: 'input', data: pendingPaste.command }));
+    // Commands chosen in the terminal sidebar must travel through this exact
+    // PTY, just like physical typing.  The command-library page keeps its
+    // separate HTTP batch dispatcher for multiple terminal targets.
+    const data = pendingPaste.mode === 'execute'
+      ? `${pendingPaste.command}\r`
+      : pendingPaste.command;
+    socket.send(JSON.stringify({ type: 'input', data }));
     terminalRef.current?.focus();
-    onPasteComplete?.(pendingPaste.id);
+    onPasteComplete?.(pendingPaste);
   }, [pendingPaste?.id, connection, terminalReady]);
 
   useEffect(() => { if (query && searchRef.current) searchRef.current.findNext(query); }, [query]);
@@ -1662,7 +2075,13 @@ function XTermPanel({ theme, server, lines, query, setQuery, onSend, pendingPast
     }
   };
 
-  return <div className="terminal-main panel"><div className="terminal-toolbar"><div className="terminal-target"><span className={`terminal-live-dot ${connection === 'connected' ? '' : 'preview'}`} /><strong>{server.name}</strong><span>{shellLabel(server.shell)} · {server.dir || '默认用户目录'}</span></div><div className="terminal-tools"><label className="terminal-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索终端输出" />{query && <button onClick={() => setQuery('')}><X size={13} /></button>}</label><button className="icon-button compact" onClick={() => searchRef.current?.findPrevious(query)} title="上一个匹配"><ChevronDown size={15} className="rotate-180" /></button><button className="icon-button compact" onClick={() => searchRef.current?.findNext(query)} title="下一个匹配"><ChevronDown size={15} /></button><button className="icon-button compact" onClick={copyTerminalSelection} disabled={!selectionAvailable} title="复制选中内容 (Ctrl+Shift+C)"><Copy size={14} /></button><button className="icon-button compact" onClick={() => terminalRef.current?.clear()} title="清空终端"><TrashIcon /></button></div></div><div className="xterm-host" ref={hostRef} /><div className="terminal-footer"><span className={connection === 'connected' ? 'pty-connected' : 'pty-preview'}>{connection === 'connected' ? <><Wifi size={13} /> WebSocket · {shellLabel(server.shell)}</> : <><WifiOff size={13} /> 本地预览 · 等待终端后端</>}</span><span>{copyState === 'copied' ? '已复制选中内容' : copyState === 'failed' ? '复制失败' : '拖选文本后右键或按 Ctrl+Shift+C 复制'}</span><span>UTF-8</span><span>{terminalRef.current ? `PTY ${terminalRef.current.cols} × ${terminalRef.current.rows}` : 'PTY'}</span></div></div>;
+  const connectionLabel = connection === 'connected'
+    ? <><Wifi size={13} /> WebSocket · {shellLabel(server.shell)}</>
+    : connection === 'connecting'
+      ? <><RefreshCw size={13} className="spin" /> 正在同步终端画面</>
+      : <><WifiOff size={13} /> 本地预览 · 等待终端后端</>;
+  const connectionClass = connection === 'connected' ? 'pty-connected' : connection === 'connecting' ? 'pty-connecting' : 'pty-preview';
+  return <div className="terminal-main panel"><div className="terminal-toolbar"><div className="terminal-target"><span className={`terminal-live-dot ${connection === 'connected' ? '' : 'preview'}`} /><strong>{server.name}</strong><span>{shellLabel(server.shell)} · {server.dir || '默认用户目录'}</span></div><div className="terminal-tools"><label className="terminal-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索终端输出" />{query && <button onClick={() => setQuery('')}><X size={13} /></button>}</label><button className="icon-button compact" onClick={() => searchRef.current?.findPrevious(query)} title="上一个匹配"><ChevronDown size={15} className="rotate-180" /></button><button className="icon-button compact" onClick={() => searchRef.current?.findNext(query)} title="下一个匹配"><ChevronDown size={15} /></button><button className="icon-button compact" onClick={copyTerminalSelection} disabled={!selectionAvailable} title="复制选中内容 (Ctrl+Shift+C)"><Copy size={14} /></button><button className="icon-button compact" onClick={() => terminalRef.current?.clear()} title="清空终端"><TrashIcon /></button></div></div><div className="xterm-host" ref={hostRef} /><div className="terminal-footer"><span className={connectionClass}>{connectionLabel}</span><span>{copyState === 'copied' ? '已复制选中内容' : copyState === 'failed' ? '复制失败' : copyState === 'pasted' ? '已粘贴，按 Enter 执行' : copyState === 'paste-failed' ? '粘贴失败' : '右键粘贴 · Ctrl+V / Ctrl+Shift+V / Shift+Insert'}</span><span>UTF-8</span><span>{terminalRef.current ? `PTY ${terminalRef.current.cols} × ${terminalRef.current.rows}` : 'PTY'}</span></div></div>;
 }
 
 function TrashIcon() { return <span className="trash-icon" />; }
