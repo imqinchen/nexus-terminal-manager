@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
@@ -28,7 +29,6 @@ import {
   LayoutDashboard,
   Layers3,
   ListChecks,
-  Maximize2,
   Menu,
   MessageSquare,
   Moon,
@@ -416,6 +416,67 @@ function hydrateGroups(rawGroups) {
   }));
 }
 
+function normalizeFourPaneLayout(value) {
+  const normalizeRatio = (ratioValue) => {
+    const ratio = Number(ratioValue);
+    return Number.isFinite(ratio) && ratio >= 0.3 && ratio <= 0.7 ? ratio : 0.5;
+  };
+  return {
+    columnRatio: normalizeRatio(value?.columnRatio),
+    rowRatio: normalizeRatio(value?.rowRatio),
+  };
+}
+
+function normalizeThreePaneLayout(value) {
+  const firstRatio = Number(value?.firstRatio);
+  const secondRatio = Number(value?.secondRatio);
+  const thirdRatio = 1 - firstRatio - secondRatio;
+  return Number.isFinite(firstRatio) && Number.isFinite(secondRatio)
+    && firstRatio >= 0.2 && secondRatio >= 0.2 && thirdRatio >= 0.2
+    ? { firstRatio, secondRatio }
+    : { firstRatio: 1 / 3, secondRatio: 1 / 3 };
+}
+
+function normalizeTerminalWorkspaces(rawWorkspaces, servers = []) {
+  const validServerIds = new Set(servers.map((server) => server.id));
+  const usedWorkspaceIds = new Set();
+  return (Array.isArray(rawWorkspaces) ? rawWorkspaces : []).map((workspace, index) => {
+    const rawId = String(workspace?.id || `workspace-${index + 1}`);
+    const baseId = rawId.startsWith('workspace-') ? makeId(rawId.slice('workspace-'.length), 'workspace') : makeId(rawId, 'workspace');
+    let id = baseId;
+    let suffix = 2;
+    while (usedWorkspaceIds.has(id)) { id = `${baseId}-${suffix}`; suffix += 1; }
+    usedWorkspaceIds.add(id);
+    const seenServerIds = new Set();
+    const serverIds = [];
+    for (const rawServerId of Array.isArray(workspace?.serverIds) ? workspace.serverIds : []) {
+      const serverId = String(rawServerId || '');
+      if (!validServerIds.has(serverId) || seenServerIds.has(serverId)) continue;
+      seenServerIds.add(serverId);
+      serverIds.push(serverId);
+      if (serverIds.length === 4) break;
+    }
+    return {
+      id,
+      name: String(workspace?.name || `终端工作区 ${index + 1}`).trim().slice(0, 120) || `终端工作区 ${index + 1}`,
+      serverIds,
+      threePaneLayout: normalizeThreePaneLayout(workspace?.threePaneLayout),
+      fourPaneLayout: normalizeFourPaneLayout(workspace?.fourPaneLayout),
+    };
+  });
+}
+
+function sameTerminalWorkspaces(left, right) {
+  return left.length === right.length && left.every((workspace, index) => workspace.id === right[index]?.id
+    && workspace.name === right[index]?.name
+    && workspace.serverIds.length === right[index]?.serverIds?.length
+    && workspace.serverIds.every((serverId, serverIndex) => serverId === right[index].serverIds[serverIndex])
+    && workspace.threePaneLayout?.firstRatio === right[index]?.threePaneLayout?.firstRatio
+    && workspace.threePaneLayout?.secondRatio === right[index]?.threePaneLayout?.secondRatio
+    && workspace.fourPaneLayout?.columnRatio === right[index]?.fourPaneLayout?.columnRatio
+    && workspace.fourPaneLayout?.rowRatio === right[index]?.fourPaneLayout?.rowRatio);
+}
+
 function socketUrlFor(serverId, size = {}) {
   const base = new URL(BACKEND_BASE);
   base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -509,11 +570,15 @@ function App() {
   const [closeBehavior, setCloseBehavior] = useState(() => loadLocalState('nexus.closeBehavior', 'tray'));
   const [activeNav, setActiveNav] = useState('terminal');
   const [activeServerId, setActiveServerId] = useState('');
+  const [terminalWorkspaces, setTerminalWorkspacesState] = useState([]);
+  // Workspaces persist in servers.json. The current selection does not, so
+  // every fresh app launch returns to the first available single terminal.
+  const [terminalView, setTerminalView] = useState({ type: 'single', id: '' });
   const [selectedIds, setSelectedIds] = useState(new Set());
   const [collapsedGroups, setCollapsedGroups] = useState(new Set());
   const [linesByServer, setLinesByServer] = useState(initialLines);
   const [terminalInput, setTerminalInput] = useState('');
-  const [terminalQuery, setTerminalQuery] = useState('');
+  const [terminalQueries, setTerminalQueries] = useState({});
   const [logQuery, setLogQuery] = useState('');
   const [commandQuery, setCommandQuery] = useState('');
   const [terminalPaste, setTerminalPaste] = useState(null);
@@ -528,10 +593,6 @@ function App() {
   const [backendHealth, setBackendHealth] = useState(null);
   const [serverBusy, setServerBusy] = useState(new Set());
   const [configReloading, setConfigReloading] = useState(false);
-  // Bump this only when a configuration operation needs the visible PTY to
-  // reconnect.  In particular, deleting a *different* terminal must not
-  // leave the current xterm attached to an obsolete renderer/WebSocket.
-  const [terminalReconnectEpoch, setTerminalReconnectEpoch] = useState(0);
   const configStampRef = useRef(null);
   const configBackendRevisionRef = useRef(0);
   const configEditRevisionRef = useRef(0);
@@ -551,16 +612,56 @@ function App() {
   const setCommands = (value) => updateLocalConfig(setCommandsState, value);
   const setWorkflows = (value) => updateLocalConfig(setWorkflowsState, value);
   const setSchedules = (value) => updateLocalConfig(setSchedulesState, value);
+  const setTerminalWorkspaces = (value) => updateLocalConfig(setTerminalWorkspacesState, value);
 
   const servers = useMemo(() => flattenGroups(groups), [groups]);
-  const activeServer = servers.find((server) => server.id === activeServerId) || servers[0];
+  const visibleTerminalIds = useMemo(() => terminalView.type === 'workspace'
+    ? terminalWorkspaces.find((workspace) => workspace.id === terminalView.id)?.serverIds || []
+    : terminalView.id ? [terminalView.id] : [], [terminalView, terminalWorkspaces]);
+  const visibleServers = useMemo(() => visibleTerminalIds
+    .map((id) => servers.find((server) => server.id === id))
+    .filter(Boolean), [visibleTerminalIds, servers]);
+  const activeServer = visibleServers.find((server) => server.id === activeServerId)
+    || visibleServers[0]
+    || servers.find((server) => server.id === activeServerId)
+    || servers[0];
   const selectedServers = servers.filter((server) => selectedIds.has(server.id));
   const filteredCommands = commands.filter((item) => `${item.name} ${item.command} ${item.description}`.toLowerCase().includes(commandQuery.toLowerCase()));
 
+  // Keep workspace members valid when services are deleted or servers.json is
+  // reloaded externally. The backend mirrors this normalization on save.
   useEffect(() => {
-    if (!activeServer && servers[0]) setActiveServerId(servers[0].id);
-    setSelectedIds((current) => new Set([...current].filter((id) => servers.some((server) => server.id === id))));
-  }, [activeServer, servers]);
+    const validIds = new Set(servers.map((server) => server.id));
+    setTerminalWorkspacesState((current) => {
+      const next = normalizeTerminalWorkspaces(current, servers);
+      return sameTerminalWorkspaces(current, next) ? current : next;
+    });
+    setTerminalView((current) => {
+      if (current.type === 'workspace') return current;
+      if (current.type === 'single' && validIds.has(current.id)) return current;
+      return { type: 'single', id: servers[0]?.id || '' };
+    });
+    setTerminalQueries((current) => {
+      const next = Object.fromEntries(Object.entries(current).filter(([id]) => validIds.has(id)));
+      return Object.keys(next).length === Object.keys(current).length ? current : next;
+    });
+    setSelectedIds((current) => new Set([...current].filter((id) => validIds.has(id))));
+  }, [servers]);
+
+  useEffect(() => {
+    if (terminalView.type !== 'workspace') return;
+    if (!terminalWorkspaces.some((workspace) => workspace.id === terminalView.id)) {
+      setTerminalView({ type: 'single', id: servers[0]?.id || '' });
+    }
+  }, [servers, terminalView, terminalWorkspaces]);
+
+  useEffect(() => {
+    if (!visibleServers.length) {
+      if (terminalView.type === 'workspace') setActiveServerId('');
+      return;
+    }
+    if (!visibleServers.some((server) => server.id === activeServerId)) setActiveServerId(visibleServers[0].id);
+  }, [activeServerId, terminalView.type, visibleServers]);
 
   useEffect(() => {
     window.localStorage.setItem('nexus.groups.v2', JSON.stringify(groups));
@@ -673,6 +774,7 @@ function App() {
       setActiveServerId(nextServers[0]?.id || '');
     }
     if (Array.isArray(payload.config.groups)) setGroupsState(nextGroups);
+    if (Array.isArray(payload.config.terminalWorkspaces)) setTerminalWorkspacesState(normalizeTerminalWorkspaces(payload.config.terminalWorkspaces, nextServers));
     if (Array.isArray(payload.config.commands)) setCommandsState(payload.config.commands.map((command) => ({ ...command, runs: command.runs || 0, tone: command.tone || 'mint' })));
     if (Array.isArray(payload.config.workflows)) setWorkflowsState(payload.config.workflows);
     if (Array.isArray(payload.config.schedules)) setSchedulesState(payload.config.schedules);
@@ -740,7 +842,7 @@ function App() {
 
   useEffect(() => {
     if (!backendReady) return undefined;
-    const payload = { version: 1, groups, commands, workflows, schedules, settings: { logRetention: 'last-start' } };
+    const payload = { version: 1, groups, terminalWorkspaces, commands, workflows, schedules, settings: { logRetention: 'last-start' } };
     const savingRevision = configEditRevisionRef.current;
     const timer = window.setTimeout(() => enqueueConfigWrite(payload, savingRevision).then((response) => {
       if (!response) return;
@@ -752,7 +854,7 @@ function App() {
       if (savingRevision === configEditRevisionRef.current) setBackendReady(false);
     }), 250);
     return () => window.clearTimeout(timer);
-  }, [backendReady, groups, commands, workflows, schedules]);
+  }, [backendReady, groups, terminalWorkspaces, commands, workflows, schedules]);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -761,6 +863,117 @@ function App() {
   }, [toast]);
 
   const showToast = (message, tone = 'success') => setToast({ message, tone });
+
+  const selectSingleTerminal = (serverId) => {
+    const target = servers.find((server) => server.id === serverId);
+    if (!target) return false;
+    setTerminalView({ type: 'single', id: target.id });
+    setActiveServerId(target.id);
+    window.requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('nexus:focus-terminal', { detail: { serverId: target.id } })));
+    return true;
+  };
+
+  const selectTerminalWorkspace = (workspaceId) => {
+    const workspace = terminalWorkspaces.find((item) => item.id === workspaceId);
+    if (!workspace) return false;
+    const firstServer = workspace.serverIds.find((serverId) => servers.some((server) => server.id === serverId));
+    setTerminalView({ type: 'workspace', id: workspace.id });
+    setActiveServerId(firstServer || '');
+    if (firstServer) window.requestAnimationFrame(() => window.dispatchEvent(new CustomEvent('nexus:focus-terminal', { detail: { serverId: firstServer } })));
+    return true;
+  };
+
+  const focusVisibleTerminal = (serverId) => {
+    if (!visibleServers.some((server) => server.id === serverId)) return false;
+    setActiveServerId(serverId);
+    return true;
+  };
+
+  const saveTerminalWorkspace = ({ name, serverIds = [] }, existingWorkspace = null) => {
+    const trimmedName = String(name || '').trim();
+    if (!trimmedName) return;
+    const validIds = new Set(servers.map((server) => server.id));
+    const members = [...new Set(Array.isArray(serverIds) ? serverIds.map(String) : [])]
+      .filter((serverId) => validIds.has(serverId))
+      .slice(0, 4);
+    let workspaceId = existingWorkspace?.id;
+    if (!workspaceId) {
+      const baseId = makeId(trimmedName, 'workspace');
+      workspaceId = baseId;
+      let suffix = 2;
+      while (terminalWorkspaces.some((workspace) => workspace.id === workspaceId)) {
+        workspaceId = `${baseId}-${suffix}`;
+        suffix += 1;
+      }
+    }
+    const retainedThreePaneLayout = normalizeThreePaneLayout(existingWorkspace?.threePaneLayout);
+    const retainedFourPaneLayout = normalizeFourPaneLayout(existingWorkspace?.fourPaneLayout);
+    const nextWorkspace = {
+      id: workspaceId,
+      name: trimmedName.slice(0, 120),
+      serverIds: members,
+      threePaneLayout: retainedThreePaneLayout,
+      fourPaneLayout: retainedFourPaneLayout,
+    };
+    setTerminalWorkspaces((current) => existingWorkspace
+      ? current.map((workspace) => workspace.id === existingWorkspace.id ? nextWorkspace : workspace)
+      : [...current, nextWorkspace]);
+    if (!existingWorkspace) {
+      // A newly created workspace is immediately useful even when it has no
+      // members yet; opening it makes the add-members hint visible.
+      setTerminalView({ type: 'workspace', id: nextWorkspace.id });
+      setActiveServerId(members[0] || '');
+      if (members[0]) window.requestAnimationFrame(() => {
+        window.dispatchEvent(new CustomEvent('nexus:focus-terminal', { detail: { serverId: members[0] } }));
+      });
+    }
+    setModal(null);
+    showToast(existingWorkspace ? `已更新终端工作区 · ${nextWorkspace.name}` : `已新建终端工作区 · ${nextWorkspace.name}`);
+  };
+
+  const deleteTerminalWorkspace = (workspaceId) => {
+    const workspace = terminalWorkspaces.find((item) => item.id === workspaceId);
+    if (!workspace) return;
+    setTerminalWorkspaces((current) => current.filter((item) => item.id !== workspaceId));
+    if (terminalView.type === 'workspace' && terminalView.id === workspaceId) {
+      const fallback = servers[0];
+      setTerminalView({ type: 'single', id: fallback?.id || '' });
+      setActiveServerId(fallback?.id || '');
+    }
+    showToast(`已删除终端工作区 · ${workspace.name}`);
+  };
+
+  const addTerminalToWorkspace = (serverId, workspaceId) => {
+    const workspace = terminalWorkspaces.find((item) => item.id === workspaceId);
+    const server = servers.find((item) => item.id === serverId);
+    if (!workspace || !server) return;
+    if (workspace.serverIds.includes(serverId)) {
+      showToast('该终端已在此工作区中', 'warning');
+      return;
+    }
+    if (workspace.serverIds.length >= 4) {
+      showToast('每个终端工作区最多包含 4 个终端', 'warning');
+      return;
+    }
+    setTerminalWorkspaces((current) => current.map((item) => item.id === workspaceId
+      ? { ...item, serverIds: [...item.serverIds, serverId] }
+      : item));
+    showToast(`已将 ${server.name} 添加到 ${workspace.name}`);
+  };
+
+  const saveTerminalWorkspaceFourPaneLayout = (workspaceId, nextLayout) => {
+    const layout = normalizeFourPaneLayout(nextLayout);
+    setTerminalWorkspaces((current) => current.map((workspace) => workspace.id === workspaceId
+      ? { ...workspace, fourPaneLayout: layout }
+      : workspace));
+  };
+
+  const saveTerminalWorkspaceThreePaneLayout = (workspaceId, nextLayout) => {
+    const layout = normalizeThreePaneLayout(nextLayout);
+    setTerminalWorkspaces((current) => current.map((workspace) => workspace.id === workspaceId
+      ? { ...workspace, threePaneLayout: layout }
+      : workspace));
+  };
 
   const openHelpDocument = async () => {
     try {
@@ -966,7 +1179,7 @@ function App() {
       showToast(language === 'zh-CN' ? '请选择一个目标终端' : 'Select one target terminal', 'warning');
       return;
     }
-    setActiveServerId(target.id);
+    if (!selectSingleTerminal(target.id)) return;
     setActiveNav('terminal');
     setTerminalPaste({ id: `terminal-input-${Date.now()}`, serverId: target.id, command: String(command || ''), mode });
   };
@@ -989,6 +1202,23 @@ function App() {
     setGroups((current) => [...current, group]);
     setModal(null);
     showToast(`已创建分组 · ${trimmedName}`);
+  };
+
+  const moveServerToGroup = (serverId, targetGroupId) => {
+    const targetGroup = groups.find((group) => group.id === targetGroupId);
+    const server = servers.find((item) => item.id === serverId);
+    if (!targetGroup || !server || server.groupId === targetGroupId) return;
+    setGroups((current) => {
+      const movingServer = current.flatMap((group) => group.servers).find((item) => item.id === serverId);
+      if (!movingServer || !current.some((group) => group.id === targetGroupId)) return current;
+      return current.map((group) => ({
+        ...group,
+        servers: group.id === targetGroupId
+          ? [...group.servers, movingServer]
+          : group.servers.filter((item) => item.id !== serverId),
+      }));
+    });
+    showToast(`已将 ${server.name} 移至 ${targetGroup.name}`);
   };
 
   const createServer = ({ name, label, groupId, port, dir, shell = 'wsl' }) => {
@@ -1111,7 +1341,7 @@ function App() {
     setCommands(nextCommands);
     if (backendReady) {
       const savingRevision = configEditRevisionRef.current;
-      enqueueConfigWrite({ version: 1, groups, commands: nextCommands, workflows, schedules, settings: { logRetention: 'last-start' } }, savingRevision).then((response) => {
+      enqueueConfigWrite({ version: 1, groups, terminalWorkspaces, commands: nextCommands, workflows, schedules, settings: { logRetention: 'last-start' } }, savingRevision).then((response) => {
         if (!response || savingRevision !== configEditRevisionRef.current) return;
         if (response.health?.configStamp) configStampRef.current = response.health.configStamp;
         if (Number(response.health?.configRevision)) configBackendRevisionRef.current = Math.max(configBackendRevisionRef.current, Number(response.health.configRevision));
@@ -1169,14 +1399,25 @@ function App() {
       const refreshed = await backendRequest('/api/config', { timeout: 10000 }).catch(() => response);
       applyBackendConfig(refreshed, true, deleteSyncEpoch);
       setSelectedIds((current) => { const next = new Set(current); next.delete(server.id); return next; });
+      const nextServers = flattenGroups(refreshed.config?.groups || []);
+      const nextWorkspaces = normalizeTerminalWorkspaces(refreshed.config?.terminalWorkspaces, nextServers);
+      const visibleIdsAfterDelete = terminalView.type === 'workspace'
+        ? nextWorkspaces.find((workspace) => workspace.id === terminalView.id)?.serverIds || []
+        : terminalView.id === server.id ? [] : [terminalView.id];
       if (activeServerId === server.id) {
-        const nextServer = flattenGroups(refreshed.config?.groups || []).find((item) => item.id !== server.id);
+        const nextServer = visibleIdsAfterDelete
+          .map((id) => nextServers.find((item) => item.id === id))
+          .find(Boolean)
+          || (terminalView.type === 'single' ? nextServers[0] : null);
+        if (terminalView.type === 'single' && terminalView.id === server.id) {
+          setTerminalView({ type: 'single', id: nextServer?.id || '' });
+        }
         setActiveServerId(nextServer?.id || '');
+        // Keep the remaining workspace panes and their WebSockets intact.
+        if (nextServer?.id) window.requestAnimationFrame(() => {
+          window.dispatchEvent(new CustomEvent('nexus:focus-terminal', { detail: { serverId: nextServer.id } }));
+        });
       }
-      // Reload the retained terminal's renderer and WebSocket after a server
-      // deletion.  This has no effect on its service/tmux session, but makes
-      // the post-delete UI deterministic instead of requiring Ctrl+R.
-      setTerminalReconnectEpoch((current) => current + 1);
       showToast(`已停止并删除终端 · ${server.name}`);
     } catch (error) {
       showToast(`删除失败，终端配置已保留: ${error.message}`, 'warning');
@@ -1197,14 +1438,59 @@ function App() {
 
   const renderPage = () => {
     if (!activeServer && activeNav === 'terminal') return <div className="empty-state panel"><Server size={28} /><strong>暂无服务配置</strong><span>创建一个终端后，可选择 WSL 工作目录或使用 /root。</span><button className="button primary" onClick={() => setModal({ type: 'server' })}><Plus size={15} />新建终端</button></div>;
-    if (activeNav === 'terminal') return <RealTerminalPage theme={theme} reconnectEpoch={terminalReconnectEpoch} servers={servers} activeServer={activeServer} activeServerId={activeServerId} setActiveServerId={setActiveServerId} query={terminalQuery} setQuery={setTerminalQuery} onSend={sendCommand} commands={commands} onUseCommand={(item) => item.executionMode === 'paste' ? queueTerminalPaste(activeServer.id, item.command) : queueTerminalExecution(activeServer.id, item.command)} pendingPaste={terminalPaste?.serverId === activeServer.id ? terminalPaste : null} onPasteComplete={(request) => { setTerminalPaste((current) => current?.id === request.id ? null : current); if (request.mode === 'execute') { recordCommandRun(request.command); showToast(language === 'zh-CN' ? '指令已发送到当前终端' : 'Command sent to the current terminal'); } else showToast(language === 'zh-CN' ? '指令已粘贴到终端，请补充参数' : 'Command pasted; complete its parameters'); }} onAddService={() => setModal({ type: 'server' })} />;
-    if (activeNav === 'logs') return <LogsPage servers={servers} linesByServer={linesByServer} query={logQuery} setQuery={setLogQuery} onOpen={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} onOpenDirectory={() => { if (window.desktop?.openLogDirectory) window.desktop.openLogDirectory(); else showToast('请在 Electron 应用中打开日志目录', 'warning'); }} onOpenLogFile={(id) => { if (window.desktop?.openLogFile) window.desktop.openLogFile(id); else showToast('请在 Electron 应用中打开日志文件', 'warning'); }} backendReady={backendReady} />;
+    if (activeNav === 'terminal') return <RealTerminalPage
+      theme={theme}
+      servers={servers}
+      terminalWorkspaces={terminalWorkspaces}
+      terminalView={terminalView}
+      visibleServers={visibleServers}
+      activeServerId={activeServerId}
+      terminalQueries={terminalQueries}
+      setTerminalQuery={(serverId, value) => setTerminalQueries((current) => ({ ...current, [serverId]: typeof value === 'function' ? value(current[serverId] || '') : value }))}
+      onSelectSingleTerminal={selectSingleTerminal}
+      onSelectWorkspace={selectTerminalWorkspace}
+      onFocusTerminal={focusVisibleTerminal}
+      onCreateWorkspace={() => setModal({ type: 'terminal-workspace' })}
+      onEditWorkspace={(workspace) => setModal({ type: 'terminal-workspace', workspace })}
+      onDeleteWorkspace={deleteTerminalWorkspace}
+      onAddTerminalToWorkspace={addTerminalToWorkspace}
+      onThreePaneLayoutChange={saveTerminalWorkspaceThreePaneLayout}
+      onFourPaneLayoutChange={saveTerminalWorkspaceFourPaneLayout}
+      onSend={sendCommand}
+      commands={commands}
+      onUseCommand={(item) => {
+        const target = visibleServers.find((server) => server.id === activeServerId) || visibleServers[0];
+        if (!target) {
+          showToast(language === 'zh-CN' ? '当前工作区没有可操作的终端' : 'The current workspace has no terminal', 'warning');
+          return;
+        }
+        // Keep the workspace and its other PTYs mounted. Unlike the command
+        // library page, a command chosen here is delivered to the focused
+        // pane instead of replacing the view with a single-terminal screen.
+        setTerminalPaste({
+          id: `terminal-input-${Date.now()}`,
+          serverId: target.id,
+          command: String(item.command || ''),
+          mode: item.executionMode === 'paste' ? 'paste' : 'execute',
+        });
+      }}
+      pendingPaste={terminalPaste}
+      onPasteComplete={(request) => {
+        setTerminalPaste((current) => current?.id === request.id ? null : current);
+        if (request.mode === 'execute') {
+          recordCommandRun(request.command);
+          showToast(language === 'zh-CN' ? '指令已发送到当前终端' : 'Command sent to the current terminal');
+        } else showToast(language === 'zh-CN' ? '指令已粘贴到终端，请补充参数' : 'Command pasted; complete its parameters');
+      }}
+      onAddService={() => setModal({ type: 'server' })}
+    />;
+    if (activeNav === 'logs') return <LogsPage servers={servers} linesByServer={linesByServer} query={logQuery} setQuery={setLogQuery} onOpen={(id) => { if (selectSingleTerminal(id)) setActiveNav('terminal'); }} onOpenDirectory={() => { if (window.desktop?.openLogDirectory) window.desktop.openLogDirectory(); else showToast('请在 Electron 应用中打开日志目录', 'warning'); }} onOpenLogFile={(id) => { if (window.desktop?.openLogFile) window.desktop.openLogFile(id); else showToast('请在 Electron 应用中打开日志文件', 'warning'); }} backendReady={backendReady} />;
     if (activeNav === 'commands') return <CommandsPage language={language} commands={filteredCommands} query={commandQuery} setQuery={setCommandQuery} groups={groups} selectedIds={selectedIds} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onClearSelection={() => setSelectedIds(new Set())} onRun={sendToSelectedRemote} onPaste={pasteCommandFromLibrary} onModeChange={updateCommandMode} onNew={() => setModal({ type: 'command' })} onImport={importCommandLibrary} onExport={exportCommandLibrary} onCopy={copyCommand} onEdit={(item) => setModal({ type: 'command', command: item })} onDelete={deleteCommand} />;
     if (activeNav === 'orchestration') return <OrchestrationPage language={language} workflows={workflows} schedules={schedules} servers={servers} commands={commands.filter((command) => command.executionMode !== 'paste')} backendReady={backendReady} onWorkflowsChange={setWorkflows} onSchedulesChange={setSchedules} onRun={(id) => backendRequest(`/api/workflows/${encodeURIComponent(id)}/run`, { method: 'POST' }).then((run) => { showToast(language === 'zh-CN' ? '编排已开始' : 'Workflow started'); return run; }).catch((error) => { showToast(`${language === 'zh-CN' ? '编排启动失败' : 'Workflow failed to start'}: ${error.message}`, 'warning'); throw error; })} />;
-    if (activeNav === 'overview') return <OverviewPage groups={groups} servers={servers} statusCounts={statusCounts} wsl={wsl} backendHealth={backendHealth} onOpenServiceManagement={() => setActiveNav('fleet')} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} />;
-    if (activeNav === 'fleet') return <ServiceManagementPage groups={groups} servers={servers} selectedIds={selectedIds} collapsedGroups={collapsedGroups} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onCollapse={toggleCollapsed} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} onAction={runActionRemote} onRemove={requestServerRemoval} selectedServers={selectedServers} statusCounts={statusCounts} onSend={sendToSelectedRemote} onClearSelection={() => setSelectedIds(new Set())} onAddGroup={() => setModal({ type: 'group' })} onAddService={() => setModal({ type: 'server' })} onOpenOrchestration={() => setActiveNav('orchestration')} />;
+    if (activeNav === 'overview') return <OverviewPage groups={groups} servers={servers} statusCounts={statusCounts} wsl={wsl} backendHealth={backendHealth} onOpenServiceManagement={() => setActiveNav('fleet')} onSelectServer={(id) => { if (selectSingleTerminal(id)) setActiveNav('terminal'); }} />;
+    if (activeNav === 'fleet') return <ServiceManagementPage groups={groups} servers={servers} selectedIds={selectedIds} collapsedGroups={collapsedGroups} onToggleGroup={toggleGroup} onToggleServer={toggleServer} onCollapse={toggleCollapsed} onSelectServer={(id) => { if (selectSingleTerminal(id)) setActiveNav('terminal'); }} onAction={runActionRemote} onRemove={requestServerRemoval} onMoveServer={moveServerToGroup} selectedServers={selectedServers} statusCounts={statusCounts} onSend={sendToSelectedRemote} onClearSelection={() => setSelectedIds(new Set())} onAddGroup={() => setModal({ type: 'group' })} onAddService={() => setModal({ type: 'server' })} onOpenOrchestration={() => setActiveNav('orchestration')} />;
     if (activeNav === 'settings') return <SettingsPage language={language} theme={theme} closePromptDisabled={closePromptDisabled} closeBehavior={closeBehavior} backendReady={backendReady} backendHealth={backendHealth} wsl={wsl} onLanguageChange={setLanguage} onThemeChange={setTheme} onClosePromptChange={setClosePromptDisabled} onCloseBehaviorChange={setCloseBehavior} onReloadConfig={() => reloadBackendConfig()} onRuntimeHealth={(health) => { if (!health) return; setBackendHealth(health); setWsl((current) => ({ ...current, available: health.capabilities?.wsl ?? current.available, backend: true, distro: health.distro || current.distro })); }} onNotify={showToast} />;
-    return <OverviewPage groups={groups} servers={servers} statusCounts={statusCounts} wsl={wsl} backendHealth={backendHealth} onOpenServiceManagement={() => setActiveNav('fleet')} onSelectServer={(id) => { setActiveServerId(id); setActiveNav('terminal'); }} />;
+    return <OverviewPage groups={groups} servers={servers} statusCounts={statusCounts} wsl={wsl} backendHealth={backendHealth} onOpenServiceManagement={() => setActiveNav('fleet')} onSelectServer={(id) => { if (selectSingleTerminal(id)) setActiveNav('terminal'); }} />;
   };
 
   return (
@@ -1234,7 +1520,7 @@ function App() {
         <div className="sidebar-divider" />
         <nav className="nav-section">
           <span className="nav-label">QUICK ACCESS</span>
-          {servers.slice(0, 3).map((server) => <button key={server.id} className="nav-item" onClick={() => { setActiveNav('terminal'); setActiveServerId(server.id); }}><Radio size={17} strokeWidth={1.8} /><span>{server.name}</span><span className={`mini-dot ${server.status === 'running' ? 'online' : ''}`} /></button>)}
+          {servers.slice(0, 3).map((server) => <button key={server.id} className="nav-item" onClick={() => { if (selectSingleTerminal(server.id)) setActiveNav('terminal'); }}><Radio size={17} strokeWidth={1.8} /><span>{server.name}</span><span className={`mini-dot ${server.status === 'running' ? 'online' : ''}`} /></button>)}
         </nav>
 
         <div className="sidebar-bottom">
@@ -1264,7 +1550,7 @@ function App() {
       {toast && <div className={`toast toast-${toast.tone}`}><CheckCircle2 size={17} />{toast.message}<button onClick={() => setToast(null)}><X size={14} /></button></div>}
       {modal?.type === 'delete-server'
         ? <DeleteServerModal language={language} server={modal.server} busy={serverBusy.has(modal.server?.id)} onCancel={closeDeleteServerModal} onConfirm={confirmServerRemoval} />
-        : modal && <CreationModal key={`${modal.type}-${modal.command?.id || 'new'}`} language={language} type={modal.type} groups={groups} wsl={wsl} terminalProfiles={terminalProfiles} initialCommand={modal.command} onClose={() => setModal(null)} onCreate={modal.type === 'group' ? createGroup : modal.type === 'server' ? createServer : (form) => saveCommand(form, modal.command)} />}
+        : modal && <CreationModal key={`${modal.type}-${modal.command?.id || modal.workspace?.id || 'new'}`} language={language} type={modal.type} groups={groups} servers={servers} wsl={wsl} terminalProfiles={terminalProfiles} initialCommand={modal.command} initialWorkspace={modal.workspace} onClose={() => setModal(null)} onCreate={modal.type === 'group' ? createGroup : modal.type === 'server' ? createServer : modal.type === 'terminal-workspace' ? (form) => saveTerminalWorkspace(form, modal.workspace) : (form) => saveCommand(form, modal.command)} />}
     </div>
   );
 }
@@ -1381,14 +1667,14 @@ function OverviewPage({ groups, servers, statusCounts, wsl, backendHealth, onOpe
   </>;
 }
 
-function ServiceManagementPage({ groups, servers, selectedIds, collapsedGroups, onToggleGroup, onToggleServer, onCollapse, onSelectServer, onAction, onRemove, selectedServers, statusCounts, onSend, onClearSelection, onAddGroup, onAddService, onOpenOrchestration }) {
+function ServiceManagementPage({ groups, servers, selectedIds, collapsedGroups, onToggleGroup, onToggleServer, onCollapse, onSelectServer, onAction, onRemove, onMoveServer, selectedServers, statusCounts, onSend, onClearSelection, onAddGroup, onAddService, onOpenOrchestration }) {
   const running = statusCounts.running || 0;
   const issues = (statusCounts.warning || 0) + (statusCounts.starting || 0);
   return <>
     <PageIntro
       eyebrow="SERVICE MANAGEMENT"
       title="服务管理"
-      description="勾选分组或终端，执行停止或批量命令；启动流程请在服务编排中配置。"
+      description="勾选分组或终端执行批量操作；从终端的更多菜单可转移分组。"
       actions={<><button className="button secondary" onClick={onAddGroup}><Plus size={16} />新建分组</button><button className="button secondary" onClick={onAddService}><Plus size={16} />新建终端</button><button className="button primary" onClick={onOpenOrchestration}><GitBranch size={16} />服务编排</button></>}
     />
 
@@ -1402,7 +1688,7 @@ function ServiceManagementPage({ groups, servers, selectedIds, collapsedGroups, 
     <div className="selection-toolbar panel"><div><strong>已选择 {selectedIds.size} 个终端</strong><span>可按分组或单个终端进行选择；开服请使用服务编排。</span></div><div className="selection-actions"><button className="text-button" onClick={onClearSelection} disabled={!selectedIds.size}><Square size={14} />清空选择</button><button className="text-button" onClick={() => onAction('stop')} disabled={!selectedIds.size}><Square size={14} />停止已选</button></div></div>
 
     <div className="section-heading"><div><h2>服务分组</h2><span>这里的选择状态会与指令库共享。</span></div><div className="section-actions"><button className="text-button" onClick={onAddGroup}><Plus size={15} />新建分组</button><button className="text-button" onClick={onAddService}><Plus size={15} />新建终端</button></div></div>
-    <div className="fleet-stack">{groups.map((group) => <GroupPanel key={group.id} group={group} selectedIds={selectedIds} collapsed={collapsedGroups.has(group.id)} onToggleGroup={() => onToggleGroup(group)} onToggleServer={onToggleServer} onCollapse={() => onCollapse(group.id)} onSelectServer={onSelectServer} onAction={onAction} onRemove={onRemove} />)}{!groups.length && <div className="empty-state panel"><Layers3 size={28} /><strong>还没有服务分组</strong><span>创建分组或添加终端开始使用。</span><div><button className="button secondary" onClick={onAddGroup}><Plus size={15} />新建分组</button><button className="button primary" onClick={onAddService}><Plus size={15} />新建终端</button></div></div>}</div>
+    <div className="fleet-stack">{groups.map((group) => <GroupPanel key={group.id} group={group} groups={groups} selectedIds={selectedIds} collapsed={collapsedGroups.has(group.id)} onToggleGroup={() => onToggleGroup(group)} onToggleServer={onToggleServer} onCollapse={() => onCollapse(group.id)} onSelectServer={onSelectServer} onAction={onAction} onRemove={onRemove} onMoveServer={onMoveServer} />)}{!groups.length && <div className="empty-state panel"><Layers3 size={28} /><strong>还没有服务分组</strong><span>创建分组或添加终端开始使用。</span><div><button className="button secondary" onClick={onAddGroup}><Plus size={15} />新建分组</button><button className="button primary" onClick={onAddService}><Plus size={15} />新建终端</button></div></div>}</div>
 
     <div className="lower-grid"><QuickCommand onSend={onSend} selectedServers={selectedServers} /><section className="selection-help panel"><div className="panel-heading"><div><h3>批量操作流程</h3><span>本页所有操作都基于当前选择。</span></div><ListChecks size={18} className="panel-heading-icon" /></div><div className="selection-help-list"><div><Check size={15} /><span>选择分组即可选中其中的全部终端。</span></div><div><Terminal size={15} /><span>点击服务名称可以打开真实 PTY 终端。</span></div><div><Command size={15} /><span>指令库适合保存并重复广播常用命令。</span></div><div><GitBranch size={15} /><span>启动命令和执行顺序请在服务编排中配置。</span></div></div></section></div>
   </>;
@@ -1533,21 +1819,22 @@ function MetricCard({ label, value, detail, icon, tone }) {
   return <div className={`metric-card metric-${tone}`}><div className="metric-top"><span>{label}</span><span className="metric-icon">{icon}</span></div><div className="metric-value">{value}</div><div className="metric-detail">{detail}</div></div>;
 }
 
-function GroupPanel({ group, selectedIds, collapsed, onToggleGroup, onToggleServer, onCollapse, onSelectServer, onAction, onRemove }) {
+function GroupPanel({ group, groups, selectedIds, collapsed, onToggleGroup, onToggleServer, onCollapse, onSelectServer, onAction, onRemove, onMoveServer }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const allSelected = group.servers.length > 0 && group.servers.every((server) => selectedIds.has(server.id));
   const someSelected = group.servers.some((server) => selectedIds.has(server.id));
   const running = group.servers.filter((server) => server.status === 'running').length;
-  return <section className="group-panel"><div className="group-header"><button className="collapse-toggle" onClick={onCollapse}>{collapsed ? <ChevronRight size={18} /> : <ChevronDown size={18} />}</button><button className={`group-check ${allSelected ? 'checked' : someSelected ? 'partial' : ''}`} onClick={onToggleGroup}>{allSelected ? <Check size={14} /> : someSelected ? <MinusIcon /> : null}</button><div className={`group-accent accent-${group.accent}`} /><div className="group-title"><strong>{group.name}</strong><span>{group.note}</span></div><div className="group-health"><span className="health-live" />{running}/{group.servers.length} running</div><button className="icon-button compact" title="更多分组操作" aria-label="更多分组操作" onClick={() => setMenuOpen((value) => !value)}><MoreHorizontal size={16} /></button>{menuOpen && <div className="row-menu group-row-menu"><button onClick={() => { onToggleGroup(); setMenuOpen(false); }}>{allSelected ? <Square size={14} /> : <Check size={14} />}{allSelected ? '清空分组选择' : '选择整个分组'}</button><button onClick={() => { onCollapse(); setMenuOpen(false); }}>{collapsed ? <ChevronDown size={14} /> : <ChevronRight size={14} />}{collapsed ? '展开分组' : '折叠分组'}</button></div>}</div>{!collapsed && <div className="server-list">{group.servers.map((server) => <ServerRow key={server.id} server={server} selected={selectedIds.has(server.id)} onToggle={() => onToggleServer(server.id)} onSelect={() => onSelectServer(server.id)} onAction={onAction} onRemove={onRemove} />)}</div>}</section>;
+  return <section className="group-panel"><div className="group-header"><button className="collapse-toggle" onClick={onCollapse}>{collapsed ? <ChevronRight size={18} /> : <ChevronDown size={18} />}</button><button className={`group-check ${allSelected ? 'checked' : someSelected ? 'partial' : ''}`} onClick={onToggleGroup}>{allSelected ? <Check size={14} /> : someSelected ? <MinusIcon /> : null}</button><div className={`group-accent accent-${group.accent}`} /><div className="group-title"><strong>{group.name}</strong><span>{group.note}</span></div><div className="group-health"><span className="health-live" />{running}/{group.servers.length} running</div><button className="icon-button compact" title="更多分组操作" aria-label="更多分组操作" onClick={() => setMenuOpen((value) => !value)}><MoreHorizontal size={16} /></button>{menuOpen && <div className="row-menu group-row-menu"><button onClick={() => { onToggleGroup(); setMenuOpen(false); }}>{allSelected ? <Square size={14} /> : <Check size={14} />}{allSelected ? '清空分组选择' : '选择整个分组'}</button><button onClick={() => { onCollapse(); setMenuOpen(false); }}>{collapsed ? <ChevronDown size={14} /> : <ChevronRight size={14} />}{collapsed ? '展开分组' : '折叠分组'}</button></div>}</div>{!collapsed && <div className="server-list">{group.servers.map((server) => <ServerRow key={server.id} server={server} groupId={group.id} groups={groups} selected={selectedIds.has(server.id)} onToggle={() => onToggleServer(server.id)} onSelect={() => onSelectServer(server.id)} onAction={onAction} onRemove={onRemove} onMoveServer={onMoveServer} />)}</div>}</section>;
 }
 
 function MinusIcon() { return <span className="minus-icon" />; }
 
-function ServerRow({ server, selected, onToggle, onSelect, onAction, onRemove }) {
+function ServerRow({ server, groupId, groups, selected, onToggle, onSelect, onAction, onRemove, onMoveServer }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const status = statusMeta[server.status];
   const isRunning = server.status === 'running';
-  return <div className={`server-row ${selected ? 'selected' : ''}`}><button className={`row-check ${selected ? 'checked' : ''}`} onClick={onToggle}>{selected && <Check size={13} />}</button><div className="server-identity" onClick={onSelect}><div className={`server-icon server-icon-${server.status}`}><Server size={16} /></div><div><strong>{server.name}</strong><span>{server.label} <i /> :{server.port || '—'}</span></div></div><div className={`status-badge ${status.className}`}><span>{status.dot}</span>{status.label}</div><div className="row-stat"><span>UPTIME</span><strong>{server.uptime}</strong></div><div className="row-stat"><span>PLAYERS</span><strong>{server.players}</strong></div><div className="row-stat"><span>MEMORY</span><strong>{server.memory}</strong></div><div className="row-actions"><button className="icon-button compact" onClick={() => onSelect()} title="打开终端"><Terminal size={15} /></button>{isRunning && <button className="icon-button compact" onClick={() => onAction('stop', [server.id])} title="停止服务"><Square size={14} /></button>}<button className="icon-button compact" title="更多操作" aria-label="更多操作" onClick={() => setMenuOpen((value) => !value)}><MoreHorizontal size={15} /></button>{menuOpen && <div className="row-menu server-row-menu"><button onClick={() => { onSelect(); setMenuOpen(false); }}><Terminal size={14} />打开终端</button>{isRunning && <button onClick={() => { onAction('stop', [server.id]); setMenuOpen(false); }}><Square size={14} />停止服务</button>}<button className="danger" onClick={() => { onRemove?.(server); setMenuOpen(false); }}><Trash2 size={14} />删除终端</button></div>}</div></div>;
+  const otherGroups = (groups || []).filter((group) => group.id !== groupId);
+  return <div className={`server-row ${selected ? 'selected' : ''}`}><button className={`row-check ${selected ? 'checked' : ''}`} onClick={onToggle}>{selected && <Check size={13} />}</button><div className="server-identity" onClick={onSelect}><div className={`server-icon server-icon-${server.status}`}><Server size={16} /></div><div><strong>{server.name}</strong><span>{server.label} <i /> :{server.port || '—'}</span></div></div><div className={`status-badge ${status.className}`}><span>{status.dot}</span>{status.label}</div><div className="row-stat"><span>UPTIME</span><strong>{server.uptime}</strong></div><div className="row-stat"><span>PLAYERS</span><strong>{server.players}</strong></div><div className="row-stat"><span>MEMORY</span><strong>{server.memory}</strong></div><div className="row-actions"><button className="icon-button compact" onClick={() => onSelect()} title="打开终端"><Terminal size={15} /></button>{isRunning && <button className="icon-button compact" onClick={() => onAction('stop', [server.id])} title="停止服务"><Square size={14} /></button>}<button className="icon-button compact" title="更多操作" aria-label="更多操作" onClick={() => setMenuOpen((value) => !value)}><MoreHorizontal size={15} /></button>{menuOpen && <div className="row-menu server-row-menu"><button onClick={() => { onSelect(); setMenuOpen(false); }}><Terminal size={14} />打开终端</button>{isRunning && <button onClick={() => { onAction('stop', [server.id]); setMenuOpen(false); }}><Square size={14} />停止服务</button>}<div className="row-menu-section-label">移至分组</div>{otherGroups.length ? otherGroups.map((group) => <button key={group.id} onClick={() => { onMoveServer?.(server.id, group.id); setMenuOpen(false); }}><Layers3 size={14} />{group.name}</button>) : <div className="row-menu-empty">请先新建其他分组</div>}<button className="danger" onClick={() => { onRemove?.(server); setMenuOpen(false); }}><Trash2 size={14} />删除终端</button></div>}</div></div>;
 }
 
 function RecentActivity({ servers }) {
@@ -1567,35 +1854,297 @@ function QuickCommand({ onSend, selectedServers }) {
 function TerminalPage({ servers, activeServer, activeServerId, setActiveServerId, lines, query, setQuery, input, setInput, onSend }) {
   const matchingLines = query ? lines.filter((line) => line.toLowerCase().includes(query.toLowerCase())) : lines;
   return <>
-    <PageIntro eyebrow="INTERACTIVE SHELL" title="终端" description="连接到 tmux 会话，实时查看输出并发送控制台指令。" actions={<><button className="button secondary"><Copy size={16} />复制会话地址</button><button className="button primary"><Maximize2 size={16} />全屏终端</button></>} />
+    <PageIntro eyebrow="INTERACTIVE SHELL" title="终端" description="连接到 tmux 会话，实时查看输出并发送控制台指令。" />
     <div className="terminal-layout"><div className="terminal-sidebar panel"><div className="terminal-sidebar-heading"><span>ACTIVE SESSIONS</span><button className="icon-button compact"><Plus size={15} /></button></div>{servers.map((server) => <button key={server.id} className={`terminal-session ${activeServerId === server.id ? 'active' : ''}`} onClick={() => setActiveServerId(server.id)}><span className={`session-dot ${server.status}`} /><span className="session-name"><strong>{server.name}</strong><small>{server.groupName}</small></span><span className="session-state">{server.status === 'running' ? 'live' : statusMeta[server.status].label}</span></button>)}</div><div className="terminal-main panel"><div className="terminal-toolbar"><div className="terminal-target"><span className="terminal-live-dot" /><strong>{activeServer.name}</strong><span>{activeServer.dir}</span></div><div className="terminal-tools"><label className="terminal-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索当前输出" />{query && <button onClick={() => setQuery('')}><X size={13} /></button>}</label><button className="icon-button compact" title="清空当前输出"><TrashIcon /></button><button className="icon-button compact" title="更多"><MoreHorizontal size={16} /></button></div></div><div className="terminal-screen"><div className="terminal-banner"><span>nexus://local/{activeServer.id}</span><span>PTY 120 × 32</span></div><div className="terminal-lines">{matchingLines.length ? matchingLines.map((line, index) => <div className={`terminal-line ${line.includes('WARN') ? 'line-warn' : line.includes('> ') ? 'line-command' : ''}`} key={`${line}-${index}`}><span className="line-no">{index + 1}</span><span>{highlight(line, query)}</span></div>) : <div className="empty-terminal">没有匹配的输出</div>}</div></div><div className="terminal-input-row"><span className="terminal-prompt">&gt;</span><input autoFocus value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') onSend(activeServer.id, input); }} placeholder="输入控制台指令，按 Enter 发送" /><button onClick={() => onSend(activeServer.id, input)}><Send size={16} /></button></div><div className="terminal-footer"><span><Wifi size={13} /> WebSocket connected</span><span>UTF-8</span><span>Ln {lines.length}, Col 1</span></div></div></div>
   </>;
 }
 
-function RealTerminalPage({ theme, reconnectEpoch, servers, activeServer, activeServerId, setActiveServerId, query, setQuery, onSend, commands, onUseCommand, pendingPaste, onPasteComplete, onAddService }) {
-  const focusActiveTerminal = () => window.dispatchEvent(new CustomEvent('nexus:focus-terminal', {
-    detail: { serverId: activeServer.id },
-  }));
+function RealTerminalPage({ theme, servers, terminalWorkspaces, terminalView, visibleServers, activeServerId, terminalQueries, setTerminalQuery, onSelectSingleTerminal, onSelectWorkspace, onFocusTerminal, onCreateWorkspace, onEditWorkspace, onDeleteWorkspace, onAddTerminalToWorkspace, onThreePaneLayoutChange, onFourPaneLayoutChange, onSend, commands, onUseCommand, pendingPaste, onPasteComplete, onAddService }) {
+  const [workspaceMenu, setWorkspaceMenu] = useState(null);
+  const [openServerMenuId, setOpenServerMenuId] = useState('');
+  const selectedWorkspace = terminalView.type === 'workspace'
+    ? terminalWorkspaces.find((workspace) => workspace.id === terminalView.id)
+    : null;
+  const selectWorkspace = (workspaceId) => {
+    if (onSelectWorkspace(workspaceId)) setWorkspaceMenu(null);
+  };
+  const selectSingleTerminal = (serverId) => {
+    if (onSelectSingleTerminal(serverId)) setOpenServerMenuId('');
+  };
+  const activeVisibleServer = visibleServers.find((server) => server.id === activeServerId) || visibleServers[0] || null;
+  const viewTitle = selectedWorkspace?.name || activeVisibleServer?.name || '终端';
+  const viewDescription = selectedWorkspace
+    ? `${visibleServers.length} / 4 个终端 · 工作区视图`
+    : activeVisibleServer ? `${shellLabel(activeVisibleServer.shell)} · 单终端视图` : '单终端视图';
+  const openWorkspaceMenu = (workspace, event) => {
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const width = 206;
+    const height = 84;
+    const gap = 6;
+    const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+    const top = rect.bottom + height + gap <= window.innerHeight - 8
+      ? rect.bottom + gap
+      : Math.max(8, rect.top - height - gap);
+    setWorkspaceMenu((current) => current?.id === workspace.id ? null : { id: workspace.id, left, top });
+  };
+
+  useEffect(() => {
+    const closeMenu = () => setWorkspaceMenu(null);
+    window.addEventListener('resize', closeMenu);
+    return () => window.removeEventListener('resize', closeMenu);
+  }, []);
+
+  const menuWorkspace = workspaceMenu ? terminalWorkspaces.find((workspace) => workspace.id === workspaceMenu.id) : null;
   return <>
-    <div className="terminal-new-service"><button className="button secondary" onClick={onAddService}><Plus size={15} />New terminal</button></div>
-    <PageIntro eyebrow="INTERACTIVE SHELL" title="终端" description={`连接到 ${shellLabel(activeServer.shell)} 的真实 PTY 会话，实时查看输出并输入命令。`} actions={<><button className="button secondary" onClick={() => navigator.clipboard?.writeText(`nexus://local/${activeServer.id}`)}><Copy size={16} />复制会话地址</button><button className="button primary" onClick={focusActiveTerminal}><Terminal size={16} />激活终端输入</button></>} />
-    <div className="terminal-layout"><div className="terminal-sidebar panel"><div className="terminal-sidebar-heading"><span>ACTIVE SESSIONS</span><button className="icon-button compact" onClick={onAddService} title="New terminal" aria-label="New terminal"><Plus size={15} /></button></div><div className="terminal-session-list">{servers.map((server) => <button key={server.id} className={`terminal-session ${activeServerId === server.id ? 'active' : ''}`} onClick={() => setActiveServerId(server.id)}><span className={`session-dot ${server.status}`} /><span className="session-name"><strong>{server.name}</strong><small>{server.groupName} · {shellLabel(server.shell)}</small></span><span className="session-state">{server.status === 'running' ? 'live' : statusMeta[server.status].label}</span></button>)}</div><TerminalCommandBar commands={commands} onUse={onUseCommand} /></div><XTermPanel key={`${activeServer.id}:${reconnectEpoch}`} theme={theme} server={activeServer} query={query} setQuery={setQuery} onSend={onSend} pendingPaste={pendingPaste} onPasteComplete={onPasteComplete} /></div>
+    <PageIntro eyebrow="INTERACTIVE SHELL" title="终端" description="选择终端工作区查看分屏，或点击单个终端进入单屏。工作区最多包含 4 个终端。" />
+    <div className="terminal-layout">
+      <aside className="terminal-sidebar panel">
+        <div className="terminal-sidebar-heading"><span>终端工作区</span><button className="icon-button compact" onClick={onCreateWorkspace} title="新建终端工作区" aria-label="新建终端工作区"><Plus size={15} /></button></div>
+        <div className={`terminal-workspace-list ${terminalWorkspaces.length ? '' : 'is-empty'}`}>
+          {terminalWorkspaces.map((workspace) => <div className={`terminal-workspace-row ${selectedWorkspace?.id === workspace.id ? 'active' : ''}`} key={workspace.id}>
+            <button className="terminal-workspace-select" onClick={() => selectWorkspace(workspace.id)} title={`打开工作区 ${workspace.name}`}><Layers3 size={15} /><span><strong>{workspace.name}</strong><small>{workspace.serverIds.length} / 4 个终端</small></span></button>
+            <button className="icon-button compact terminal-workspace-more" onClick={(event) => openWorkspaceMenu(workspace, event)} title={`管理 ${workspace.name}`} aria-label={`管理 ${workspace.name}`}><MoreHorizontal size={15} /></button>
+          </div>)}
+          {!terminalWorkspaces.length && <div className="terminal-sidebar-empty">还没有终端工作区。点击右侧加号可创建空工作区。</div>}
+        </div>
+        <div className="terminal-sidebar-heading terminal-all-heading"><span>全部终端</span><button className="icon-button compact" onClick={onAddService} title="新建终端配置" aria-label="新建终端配置"><Plus size={15} /></button></div>
+        <div className="terminal-session-list terminal-all-session-list">{servers.map((server) => <div className="terminal-session-wrap" key={server.id}>
+          <button className={`terminal-session ${terminalView.type === 'single' && terminalView.id === server.id ? 'active' : ''} ${activeServerId === server.id && terminalView.type === 'workspace' ? 'focused' : ''}`} onClick={() => selectSingleTerminal(server.id)} title={`以单终端视图打开 ${server.name}`}><span className={`session-dot ${server.status}`} /><span className="session-name"><strong>{server.name}</strong><small>{server.groupName} · {shellLabel(server.shell)}</small></span><span className="session-state">{server.status === 'running' ? 'live' : statusMeta[server.status].label}</span></button>
+          <button className="icon-button compact terminal-session-more" onClick={(event) => { event.stopPropagation(); setOpenServerMenuId((current) => current === server.id ? '' : server.id); }} title={`添加 ${server.name} 到工作区`} aria-label={`添加 ${server.name} 到工作区`}><MoreHorizontal size={15} /></button>
+          {openServerMenuId === server.id && <div className="terminal-side-menu terminal-server-menu"><strong>添加到工作区</strong>{terminalWorkspaces.map((workspace) => { const exists = workspace.serverIds.includes(server.id); const full = workspace.serverIds.length >= 4; return <button key={workspace.id} disabled={exists || full} onClick={() => { onAddTerminalToWorkspace(server.id, workspace.id); setOpenServerMenuId(''); }}><Plus size={14} /><span>{workspace.name}</span><small>{exists ? '已加入' : full ? '已满' : `${workspace.serverIds.length} / 4`}</small></button>; })}{!terminalWorkspaces.length && <span>请先新建终端工作区</span>}</div>}
+        </div>)}</div>
+        <TerminalCommandBar commands={commands} onUse={onUseCommand} disabled={!activeVisibleServer} />
+      </aside>
+      <section className="terminal-workspace" aria-label="终端工作区视图">
+        <header className="terminal-view-header panel"><div className="terminal-view-title"><Layers3 size={17} /><div><strong>{viewTitle}</strong><span>{viewDescription}</span></div></div><span className="terminal-view-focus">{activeVisibleServer ? `当前操作：${activeVisibleServer.name}` : '当前工作区为空'}</span></header>
+        {visibleServers.length === 4 && selectedWorkspace
+          ? <FourPaneTerminalGrid theme={theme} workspace={selectedWorkspace} servers={visibleServers} activeServerId={activeServerId} terminalQueries={terminalQueries} setTerminalQuery={setTerminalQuery} onFocusTerminal={onFocusTerminal} onLayoutChange={onFourPaneLayoutChange} onSend={onSend} pendingPaste={pendingPaste} onPasteComplete={onPasteComplete} />
+          : visibleServers.length === 3 && selectedWorkspace
+            ? <ThreePaneTerminalGrid theme={theme} workspace={selectedWorkspace} servers={visibleServers} activeServerId={activeServerId} terminalQueries={terminalQueries} setTerminalQuery={setTerminalQuery} onFocusTerminal={onFocusTerminal} onLayoutChange={onThreePaneLayoutChange} onSend={onSend} pendingPaste={pendingPaste} onPasteComplete={onPasteComplete} />
+            : visibleServers.length ? <div className={`terminal-split-grid terminal-split-${visibleServers.length}`}>{visibleServers.map((server) => <XTermPanel key={server.id} theme={theme} server={server} focused={activeServerId === server.id} onFocus={onFocusTerminal} query={terminalQueries[server.id] || ''} setQuery={(value) => setTerminalQuery(server.id, value)} onSend={onSend} pendingPaste={pendingPaste?.serverId === server.id ? pendingPaste : null} onPasteComplete={onPasteComplete} />)}</div> : <div className="terminal-workspace-empty panel"><Layers3 size={27} /><strong>{selectedWorkspace ? '此终端工作区为空' : '没有可用终端'}</strong><span>{selectedWorkspace ? '通过左侧终端的更多菜单，将终端加入此工作区。' : '新建一个终端配置后即可开始使用。'}</span></div>}
+      </section>
+    </div>
+    {menuWorkspace && createPortal(<div className="terminal-side-menu terminal-workspace-menu terminal-floating-menu" style={{ top: workspaceMenu.top, left: workspaceMenu.left }}><button onClick={() => { onEditWorkspace(menuWorkspace); setWorkspaceMenu(null); }}><Pencil size={14} />编辑成员与名称</button><button className="danger" onClick={() => { onDeleteWorkspace(menuWorkspace.id); setWorkspaceMenu(null); }}><Trash2 size={14} />删除工作区</button></div>, document.body)}
   </>;
 }
 
-function TerminalCommandBar({ commands, onUse }) {
+function ThreePaneTerminalGrid({ theme, workspace, servers, activeServerId, terminalQueries, setTerminalQuery, onFocusTerminal, onLayoutChange, onSend, pendingPaste, onPasteComplete }) {
+  const gridRef = useRef(null);
+  const layoutRef = useRef(normalizeThreePaneLayout(workspace.threePaneLayout));
+  const dragRef = useRef(null);
+  const selectionRef = useRef(null);
+  const [layout, setLayout] = useState(() => layoutRef.current);
+  const [dragging, setDragging] = useState(false);
+
+  useEffect(() => {
+    if (dragRef.current) return;
+    const next = normalizeThreePaneLayout(workspace.threePaneLayout);
+    layoutRef.current = next;
+    setLayout(next);
+  }, [workspace.id, workspace.threePaneLayout?.firstRatio, workspace.threePaneLayout?.secondRatio]);
+
+  useEffect(() => () => {
+    if (selectionRef.current !== null) document.body.style.userSelect = selectionRef.current;
+  }, []);
+
+  const updateLayout = (partial) => {
+    const minimum = 0.2;
+    const clamp = (value, min, max) => Math.min(max, Math.max(min, Number.isFinite(Number(value)) ? Number(value) : min));
+    const current = layoutRef.current;
+    let secondRatio = clamp(partial.secondRatio ?? current.secondRatio, minimum, 1 - minimum - current.firstRatio);
+    let firstRatio = clamp(partial.firstRatio ?? current.firstRatio, minimum, 1 - minimum - secondRatio);
+    secondRatio = clamp(secondRatio, minimum, 1 - minimum - firstRatio);
+    const next = { firstRatio, secondRatio };
+    layoutRef.current = next;
+    setLayout(next);
+    return next;
+  };
+
+  const startDrag = (divider, event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    dragRef.current = { divider, pointerId: event.pointerId };
+    selectionRef.current = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';
+    setDragging(true);
+  };
+
+  const moveDrag = (event) => {
+    const drag = dragRef.current;
+    const rect = gridRef.current?.getBoundingClientRect();
+    if (!drag || drag.pointerId !== event.pointerId || !rect) return;
+    const position = (event.clientX - rect.left) / Math.max(1, rect.width);
+    updateLayout(drag.divider === 'first'
+      ? { firstRatio: position }
+      : { secondRatio: position - layoutRef.current.firstRatio });
+  };
+
+  const finishDrag = (event) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    dragRef.current = null;
+    document.body.style.userSelect = selectionRef.current;
+    selectionRef.current = null;
+    setDragging(false);
+    onLayoutChange?.(workspace.id, layoutRef.current);
+  };
+
+  const resetLayout = (event) => {
+    event.preventDefault();
+    const next = updateLayout({ firstRatio: 1 / 3, secondRatio: 1 / 3 });
+    onLayoutChange?.(workspace.id, next);
+  };
+
+  const resizeWithKeyboard = (divider, event) => {
+    if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+    event.preventDefault();
+    const delta = (event.shiftKey ? 0.05 : 0.02) * (event.key === 'ArrowLeft' ? -1 : 1);
+    const next = updateLayout(divider === 'first'
+      ? { firstRatio: layoutRef.current.firstRatio + delta }
+      : { secondRatio: layoutRef.current.secondRatio + delta });
+    onLayoutChange?.(workspace.id, next);
+  };
+
+  const thirdRatio = 1 - layout.firstRatio - layout.secondRatio;
+  const gridStyle = {
+    '--three-pane-first': `${layout.firstRatio}fr`,
+    '--three-pane-second': `${layout.secondRatio}fr`,
+    '--three-pane-third': `${thirdRatio}fr`,
+  };
+
+  return <div ref={gridRef} className={`terminal-split-grid terminal-split-3 terminal-three-pane-grid ${dragging ? 'is-resizing-column' : ''}`} style={gridStyle}>
+    {servers.map((server, index) => <div className={`terminal-three-pane-slot terminal-three-pane-slot-${index + 1}`} key={server.id}><XTermPanel theme={theme} server={server} focused={activeServerId === server.id} onFocus={onFocusTerminal} query={terminalQueries[server.id] || ''} setQuery={(value) => setTerminalQuery(server.id, value)} onSend={onSend} pendingPaste={pendingPaste?.serverId === server.id ? pendingPaste : null} onPasteComplete={onPasteComplete} /></div>)}
+    <div className="terminal-pane-divider terminal-pane-divider-column terminal-three-pane-divider-first" role="separator" tabIndex={0} aria-label="调整第一个终端宽度，双击恢复三等分" aria-orientation="vertical" aria-valuemin={20} aria-valuemax={60} aria-valuenow={Math.round(layout.firstRatio * 100)} onPointerDown={(event) => startDrag('first', event)} onPointerMove={moveDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onDoubleClick={resetLayout} onKeyDown={(event) => resizeWithKeyboard('first', event)} />
+    <div className="terminal-pane-divider terminal-pane-divider-column terminal-three-pane-divider-second" role="separator" tabIndex={0} aria-label="调整第二个终端宽度，双击恢复三等分" aria-orientation="vertical" aria-valuemin={20} aria-valuemax={60} aria-valuenow={Math.round(layout.secondRatio * 100)} onPointerDown={(event) => startDrag('second', event)} onPointerMove={moveDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onDoubleClick={resetLayout} onKeyDown={(event) => resizeWithKeyboard('second', event)} />
+  </div>;
+}
+
+function FourPaneTerminalGrid({ theme, workspace, servers, activeServerId, terminalQueries, setTerminalQuery, onFocusTerminal, onLayoutChange, onSend, pendingPaste, onPasteComplete }) {
+  const gridRef = useRef(null);
+  const layoutRef = useRef(normalizeFourPaneLayout(workspace.fourPaneLayout));
+  const dragRef = useRef(null);
+  const selectionRef = useRef(null);
+  const [layout, setLayout] = useState(() => layoutRef.current);
+  const [draggingAxis, setDraggingAxis] = useState('');
+
+  useEffect(() => {
+    if (dragRef.current) return;
+    const next = normalizeFourPaneLayout(workspace.fourPaneLayout);
+    layoutRef.current = next;
+    setLayout(next);
+  }, [workspace.id, workspace.fourPaneLayout?.columnRatio, workspace.fourPaneLayout?.rowRatio]);
+
+  useEffect(() => () => {
+    if (selectionRef.current !== null) document.body.style.userSelect = selectionRef.current;
+  }, []);
+
+  const updateLayout = (partial) => {
+    // Pointer and keyboard gestures should stop at the allowed limits rather
+    // than resetting the grid.  Persisted JSON is validated separately by
+    // normalizeFourPaneLayout above, where malformed values fall back to 50/50.
+    const clampRatio = (value) => {
+      const ratio = Number(value);
+      return Number.isFinite(ratio) ? Math.min(0.7, Math.max(0.3, ratio)) : 0.5;
+    };
+    const next = {
+      columnRatio: clampRatio(partial.columnRatio ?? layoutRef.current.columnRatio),
+      rowRatio: clampRatio(partial.rowRatio ?? layoutRef.current.rowRatio),
+    };
+    layoutRef.current = next;
+    setLayout(next);
+    return next;
+  };
+
+  const ratioForPointer = (axis, event) => {
+    const rect = gridRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    return axis === 'column'
+      ? (event.clientX - rect.left) / Math.max(1, rect.width)
+      : (event.clientY - rect.top) / Math.max(1, rect.height);
+  };
+
+  const startDrag = (axis, event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+    dragRef.current = { axis, pointerId: event.pointerId };
+    selectionRef.current = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';
+    setDraggingAxis(axis);
+  };
+
+  const moveDrag = (event) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const ratio = ratioForPointer(drag.axis, event);
+    if (ratio === null) return;
+    updateLayout(drag.axis === 'column' ? { columnRatio: ratio } : { rowRatio: ratio });
+  };
+
+  const finishDrag = (event) => {
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    event.currentTarget.releasePointerCapture?.(event.pointerId);
+    dragRef.current = null;
+    document.body.style.userSelect = selectionRef.current;
+    selectionRef.current = null;
+    setDraggingAxis('');
+    onLayoutChange?.(workspace.id, layoutRef.current);
+  };
+
+  const resetAxis = (axis, event) => {
+    event.preventDefault();
+    const next = updateLayout(axis === 'column' ? { columnRatio: 0.5 } : { rowRatio: 0.5 });
+    onLayoutChange?.(workspace.id, next);
+  };
+
+  const resizeWithKeyboard = (axis, event) => {
+    const negative = axis === 'column' ? event.key === 'ArrowLeft' : event.key === 'ArrowUp';
+    const positive = axis === 'column' ? event.key === 'ArrowRight' : event.key === 'ArrowDown';
+    if (!negative && !positive) return;
+    event.preventDefault();
+    const delta = (event.shiftKey ? 0.05 : 0.02) * (negative ? -1 : 1);
+    const next = updateLayout(axis === 'column'
+      ? { columnRatio: layoutRef.current.columnRatio + delta }
+      : { rowRatio: layoutRef.current.rowRatio + delta });
+    onLayoutChange?.(workspace.id, next);
+  };
+
+  const gridStyle = {
+    '--four-pane-left': `${layout.columnRatio}fr`,
+    '--four-pane-right': `${1 - layout.columnRatio}fr`,
+    // The row divider itself takes 10px.  Calculate against the remaining
+    // height so a 30/70 drag remains a real 30/70 visual split instead of
+    // distributing only the space left after each row's minimum height.
+    '--four-pane-top': `calc(${layout.rowRatio * 100}% - ${layout.rowRatio * 10}px)`,
+    '--four-pane-bottom': `calc(${(1 - layout.rowRatio) * 100}% - ${(1 - layout.rowRatio) * 10}px)`,
+  };
+
+  return <div ref={gridRef} className={`terminal-split-grid terminal-split-4 terminal-four-pane-grid ${draggingAxis ? `is-resizing-${draggingAxis}` : ''}`} style={gridStyle}>
+    {servers.map((server, index) => <div className={`terminal-four-pane-slot terminal-four-pane-slot-${index + 1}`} key={server.id}><XTermPanel theme={theme} server={server} focused={activeServerId === server.id} onFocus={onFocusTerminal} query={terminalQueries[server.id] || ''} setQuery={(value) => setTerminalQuery(server.id, value)} onSend={onSend} pendingPaste={pendingPaste?.serverId === server.id ? pendingPaste : null} onPasteComplete={onPasteComplete} /></div>)}
+    <div className="terminal-pane-divider terminal-pane-divider-column" role="separator" tabIndex={0} aria-label="调整左右终端宽度，双击恢复均分" aria-orientation="vertical" aria-valuemin={30} aria-valuemax={70} aria-valuenow={Math.round(layout.columnRatio * 100)} onPointerDown={(event) => startDrag('column', event)} onPointerMove={moveDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onDoubleClick={(event) => resetAxis('column', event)} onKeyDown={(event) => resizeWithKeyboard('column', event)} />
+    <div className="terminal-pane-divider terminal-pane-divider-row" role="separator" tabIndex={0} aria-label="调整上下终端高度，双击恢复均分" aria-orientation="horizontal" aria-valuemin={30} aria-valuemax={70} aria-valuenow={Math.round(layout.rowRatio * 100)} onPointerDown={(event) => startDrag('row', event)} onPointerMove={moveDrag} onPointerUp={finishDrag} onPointerCancel={finishDrag} onDoubleClick={(event) => resetAxis('row', event)} onKeyDown={(event) => resizeWithKeyboard('row', event)} />
+  </div>;
+}
+
+function TerminalCommandBar({ commands, onUse, disabled = false }) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   const filtered = commands.filter((item) => `${item.name} ${item.command}`.toLowerCase().includes(query.toLowerCase()));
-  return <div className="terminal-command-bar panel"><div><strong>当前终端指令库</strong><span>执行型附加回车，粘贴型等待补充参数</span></div><div className="terminal-command-picker"><button className="button secondary" onClick={() => setOpen((value) => !value)}><Command size={15} />选择指令<ChevronDown size={14} /></button>{open && <div className="terminal-command-menu"><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索指令" />{filtered.map((item) => { const paste = item.executionMode === 'paste'; return <button key={item.id} onClick={() => { onUse?.(item); setOpen(false); setQuery(''); }}><span><strong>{item.name}</strong><code>{item.command}</code><small>{paste ? '粘贴后补参数' : '直接执行'}</small></span>{paste ? <ClipboardPaste size={13} /> : <Play size={13} />}</button>; })}{!filtered.length && <span className="terminal-command-empty">没有匹配的指令</span>}</div>}</div></div>;
+  return <div className="terminal-command-bar panel"><div><strong>当前终端指令库</strong><span>执行型附加回车，粘贴型等待补充参数</span></div><div className="terminal-command-picker"><button className="button secondary" disabled={disabled} onClick={() => setOpen((value) => !value)}><Command size={15} />选择指令<ChevronDown size={14} /></button>{open && !disabled && <div className="terminal-command-menu"><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索指令" />{filtered.map((item) => { const paste = item.executionMode === 'paste'; return <button key={item.id} onClick={() => { onUse?.(item); setOpen(false); setQuery(''); }}><span><strong>{item.name}</strong><code>{item.command}</code><small>{paste ? '粘贴后补参数' : '直接执行'}</small></span>{paste ? <ClipboardPaste size={13} /> : <Play size={13} />}</button>; })}{!filtered.length && <span className="terminal-command-empty">没有匹配的指令</span>}</div>}</div></div>;
 }
 
-function XTermPanel({ theme, server, query, setQuery, onSend, pendingPaste, onPasteComplete }) {
+function XTermPanel({ theme, server, focused = false, onFocus, query, setQuery, onSend, pendingPaste, onPasteComplete }) {
   const hostRef = useRef(null);
   const terminalRef = useRef(null);
   const searchRef = useRef(null);
   const socketRef = useRef(null);
   const onSendRef = useRef(onSend);
+  const onFocusRef = useRef(onFocus);
+  const focusedRef = useRef(focused);
   const fallbackRef = useRef({ buffer: '', history: [], historyIndex: -1, connected: false });
   const lastPastedIdRef = useRef('');
   const [connection, setConnection] = useState('connecting');
@@ -1604,6 +2153,8 @@ function XTermPanel({ theme, server, query, setQuery, onSend, pendingPaste, onPa
   const [copyState, setCopyState] = useState('');
 
   useEffect(() => { onSendRef.current = onSend; }, [onSend]);
+  useEffect(() => { onFocusRef.current = onFocus; }, [onFocus]);
+  useEffect(() => { focusedRef.current = focused; }, [focused]);
 
   useEffect(() => {
     const terminal = new XTerm({
@@ -1660,12 +2211,16 @@ function XTermPanel({ theme, server, query, setQuery, onSend, pendingPaste, onPa
       if (event.detail?.serverId && event.detail.serverId !== server.id) return;
       focusTerminal();
     };
-    const focusOnPointerDown = () => focusTerminal();
+    const focusOnPointerDown = () => {
+      onFocusRef.current?.(server.id);
+      focusTerminal();
+    };
     window.addEventListener('nexus:focus-terminal', focusRequested);
     hostRef.current.addEventListener('pointerdown', focusOnPointerDown);
-    // Sidebar navigation buttons retain browser focus by default. When this
-    // page mounts, hand focus to xterm so Space and Enter reach the PTY.
-    focusTerminal();
+    // Only the selected pane claims keyboard focus when the page mounts.
+    // With several panes, letting every xterm focus itself would leave the
+    // final pane focused while commands target a different selected pane.
+    if (focused) focusTerminal();
 
     const copySelection = async () => {
       const value = terminal.getSelection();
@@ -1826,7 +2381,11 @@ function XTermPanel({ theme, server, query, setQuery, onSend, pendingPaste, onPa
       return special[event.key] || (event.key.length === 1 ? event.key : '');
     };
     const onWindowKeyDown = (event) => {
-      if (event.defaultPrevented || hasTerminalFocus()) return;
+      // Each split owns a window fallback so keyboard recovery still works
+      // after navigating back to the terminal page.  Limit that fallback to
+      // the selected pane; otherwise one keystroke would be replayed into
+      // every visible xterm whenever no helper textarea currently has focus.
+      if (event.defaultPrevented || hasTerminalFocus() || !focusedRef.current) return;
       const target = event.target;
       // Do not steal keys from the terminal search, command picker, modal
       // forms, or any other deliberate text-editing control.
@@ -2081,7 +2640,7 @@ function XTermPanel({ theme, server, query, setQuery, onSend, pendingPaste, onPa
       ? <><RefreshCw size={13} className="spin" /> 正在同步终端画面</>
       : <><WifiOff size={13} /> 本地预览 · 等待终端后端</>;
   const connectionClass = connection === 'connected' ? 'pty-connected' : connection === 'connecting' ? 'pty-connecting' : 'pty-preview';
-  return <div className="terminal-main panel"><div className="terminal-toolbar"><div className="terminal-target"><span className={`terminal-live-dot ${connection === 'connected' ? '' : 'preview'}`} /><strong>{server.name}</strong><span>{shellLabel(server.shell)} · {server.dir || '默认用户目录'}</span></div><div className="terminal-tools"><label className="terminal-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索终端输出" />{query && <button onClick={() => setQuery('')}><X size={13} /></button>}</label><button className="icon-button compact" onClick={() => searchRef.current?.findPrevious(query)} title="上一个匹配"><ChevronDown size={15} className="rotate-180" /></button><button className="icon-button compact" onClick={() => searchRef.current?.findNext(query)} title="下一个匹配"><ChevronDown size={15} /></button><button className="icon-button compact" onClick={copyTerminalSelection} disabled={!selectionAvailable} title="复制选中内容 (Ctrl+Shift+C)"><Copy size={14} /></button><button className="icon-button compact" onClick={() => terminalRef.current?.clear()} title="清空终端"><TrashIcon /></button></div></div><div className="xterm-host" ref={hostRef} /><div className="terminal-footer"><span className={connectionClass}>{connectionLabel}</span><span>{copyState === 'copied' ? '已复制选中内容' : copyState === 'failed' ? '复制失败' : copyState === 'pasted' ? '已粘贴，按 Enter 执行' : copyState === 'paste-failed' ? '粘贴失败' : '右键粘贴 · Ctrl+V / Ctrl+Shift+V / Shift+Insert'}</span><span>UTF-8</span><span>{terminalRef.current ? `PTY ${terminalRef.current.cols} × ${terminalRef.current.rows}` : 'PTY'}</span></div></div>;
+  return <div className={`terminal-main panel ${focused ? 'is-focused' : ''}`} onPointerDown={() => onFocus?.(server.id)}><div className="terminal-toolbar"><div className="terminal-target"><span className={`terminal-live-dot ${connection === 'connected' ? '' : 'preview'}`} /><strong>{server.name}</strong><span>{shellLabel(server.shell)} · {server.dir || '默认用户目录'}</span></div><div className="terminal-tools"><label className="terminal-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索终端输出" />{query && <button onClick={() => setQuery('')}><X size={13} /></button>}</label><button className="icon-button compact" onClick={() => searchRef.current?.findPrevious(query)} title="上一个匹配"><ChevronDown size={15} className="rotate-180" /></button><button className="icon-button compact" onClick={() => searchRef.current?.findNext(query)} title="下一个匹配"><ChevronDown size={15} /></button><button className="icon-button compact" onClick={copyTerminalSelection} disabled={!selectionAvailable} title="复制选中内容 (Ctrl+Shift+C)"><Copy size={14} /></button><button className="icon-button compact" onClick={() => terminalRef.current?.clear()} title="清空终端"><TrashIcon /></button></div></div><div className="xterm-host" ref={hostRef} /><div className="terminal-footer"><span className={connectionClass}>{connectionLabel}</span><span>{copyState === 'copied' ? '已复制选中内容' : copyState === 'failed' ? '复制失败' : copyState === 'pasted' ? '已粘贴，按 Enter 执行' : copyState === 'paste-failed' ? '粘贴失败' : '右键粘贴 · Ctrl+V / Ctrl+Shift+V / Shift+Insert'}</span><span>UTF-8</span><span>{terminalRef.current ? `PTY ${terminalRef.current.cols} × ${terminalRef.current.rows}` : 'PTY'}</span></div></div>;
 }
 
 function TrashIcon() { return <span className="trash-icon" />; }
@@ -2614,10 +3173,12 @@ function LegacyCreationModal({ type, groups, wsl, onClose, onCreate }) {
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><form className="creation-modal" onSubmit={submit}><div className="modal-header"><div><div className="eyebrow">CONFIGURATION</div><h2>{title}</h2><p>{subtitle}</p></div><button type="button" className="icon-button" onClick={onClose}><X size={17} /></button></div><div className="modal-fields">{isGroup && <><Field label="分组名称" required value={form.name} onChange={(value) => update('name', value)} placeholder="例如：生存服群" /><Field label="描述" value={form.note} onChange={(value) => update('note', value)} placeholder="这个分组负责什么" /><div className="field"><label>标识色</label><div className="swatch-row">{['mint', 'blue', 'amber', 'violet'].map((tone) => <button type="button" key={tone} className={`swatch swatch-${tone} ${form.accent === tone ? 'selected' : ''}`} onClick={() => update('accent', tone)} aria-label={tone} />)}</div></div></>}{isServer && <><Field label="服务名称" required value={form.name} onChange={(value) => update('name', value)} placeholder="例如：Survival · Event" /><Field label="服务标签" value={form.label} onChange={(value) => update('label', value)} placeholder="例如：活动服" /><div className="field-row"><Field label="所属分组" required type="select" options={groups.map((group) => ({ value: group.id, label: group.name }))} value={form.groupId} onChange={(value) => update('groupId', value)} /><Field label="端口" value={form.port} onChange={(value) => update('port', value)} placeholder="25565" /></div><Field label="WSL 工作目录" value={form.dir} onChange={(value) => update('dir', value)} placeholder="/srv/servers/event" /></>}{!isGroup && !isServer && <><Field label="指令名称" required value={form.name} onChange={(value) => update('name', value)} placeholder="例如：安全保存" /><Field label="控制台指令" required mono value={form.command} onChange={(value) => update('command', value)} placeholder="save-all" /><Field label="说明" value={form.description} onChange={(value) => update('description', value)} placeholder="简短描述这个指令的作用" /><div className="field"><label>适用范围</label><div className="scope-options">{['当前选择', '全部游戏服', '生存服群', '单个服务'].map((scope) => <button type="button" key={scope} className={form.scope === scope ? 'selected' : ''} onClick={() => update('scope', scope)}>{scope}</button>)}</div></div></>}</div><div className="modal-footer"><button type="button" className="button secondary" onClick={onClose}>取消</button><button className="button primary" type="submit"><Check size={15} />保存</button></div></form></div>;
 }
 
-function CreationModal({ language = 'zh-CN', type, groups, wsl, terminalProfiles = {}, initialCommand, onClose, onCreate }) {
+function CreationModal({ language = 'zh-CN', type, groups, servers = [], wsl, terminalProfiles = {}, initialCommand, initialWorkspace, onClose, onCreate }) {
   const isGroup = type === 'group';
   const isServer = type === 'server';
-  const isEditingCommand = !isGroup && !isServer && Boolean(initialCommand);
+  const isTerminalWorkspace = type === 'terminal-workspace';
+  const isEditingCommand = !isGroup && !isServer && !isTerminalWorkspace && Boolean(initialCommand);
+  const isEditingWorkspace = isTerminalWorkspace && Boolean(initialWorkspace);
   const isZh = language === 'zh-CN';
   const groupOptions = groups.length ? groups.map((group) => ({ value: group.id, label: group.name })) : [{ value: 'local', label: 'Local services' }];
   const initialShell = 'wsl';
@@ -2625,6 +3186,8 @@ function CreationModal({ language = 'zh-CN', type, groups, wsl, terminalProfiles
     ? { name: '', note: '', accent: 'mint' }
     : isServer
       ? { name: '', label: '', groupId: groupOptions[0].value, port: '', dir: '', shell: initialShell }
+      : isTerminalWorkspace
+        ? { name: String(initialWorkspace?.name || ''), serverIds: Array.isArray(initialWorkspace?.serverIds) ? initialWorkspace.serverIds.slice(0, 4) : [] }
       : {
         name: String(initialCommand?.name || ''),
         command: String(initialCommand?.command || ''),
@@ -2635,6 +3198,12 @@ function CreationModal({ language = 'zh-CN', type, groups, wsl, terminalProfiles
       });
   const [pickingDirectory, setPickingDirectory] = useState(false);
   const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
+  const toggleWorkspaceMember = (serverId) => setForm((current) => {
+    const serverIds = Array.isArray(current.serverIds) ? current.serverIds : [];
+    if (serverIds.includes(serverId)) return { ...current, serverIds: serverIds.filter((id) => id !== serverId) };
+    if (serverIds.length >= 4) return current;
+    return { ...current, serverIds: [...serverIds, serverId] };
+  });
   const pickDirectory = async () => {
     if (!window.desktop?.selectDirectory) {
       update('dir', defaultShellDirectory(form.shell));
@@ -2664,17 +3233,18 @@ function CreationModal({ language = 'zh-CN', type, groups, wsl, terminalProfiles
     shell: value,
     dir: '',
   }));
-  const title = isGroup ? (isZh ? '新建服务分组' : 'New service group') : isServer ? (isZh ? '新建终端' : 'New terminal') : isEditingCommand ? (isZh ? '编辑指令' : 'Edit command') : (isZh ? '保存指令' : 'Save command');
-  const subtitle = isGroup ? (isZh ? '创建一个用于归类本地终端的分组。' : 'Create a group for related local terminals.') : isServer ? (isZh ? '选择终端类型和工作目录；目录留空时使用该终端的默认目录。' : 'Choose a terminal type and working directory, or leave it blank for the default.') : (isEditingCommand ? (isZh ? '修改指令内容、说明和发送方式。' : 'Update the command, description, and send mode.') : (isZh ? '保存可直接执行或粘贴后补充参数的指令。' : 'Save a command to execute or paste before adding parameters.'));
+  const title = isTerminalWorkspace ? (isEditingWorkspace ? (isZh ? '编辑终端工作区' : 'Edit terminal workspace') : (isZh ? '新建终端工作区' : 'New terminal workspace')) : isGroup ? (isZh ? '新建服务分组' : 'New service group') : isServer ? (isZh ? '新建终端' : 'New terminal') : isEditingCommand ? (isZh ? '编辑指令' : 'Edit command') : (isZh ? '保存指令' : 'Save command');
+  const subtitle = isTerminalWorkspace ? (isZh ? '工作区与服务分组相互独立，同一终端可加入多个工作区；每组最多四个终端。' : 'Workspaces are separate from service groups. A terminal can be in multiple workspaces; each has up to four terminals.') : isGroup ? (isZh ? '创建一个用于归类本地终端的分组。' : 'Create a group for related local terminals.') : isServer ? (isZh ? '选择终端类型和工作目录；目录留空时使用该终端的默认目录。' : 'Choose a terminal type and working directory, or leave it blank for the default.') : (isEditingCommand ? (isZh ? '修改指令内容、说明和发送方式。' : 'Update the command, description, and send mode.') : (isZh ? '保存可直接执行或粘贴后补充参数的指令。' : 'Save a command to execute or paste before adding parameters.'));
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <form className="creation-modal" onSubmit={submit}>
       <div className="modal-header"><div><div className="eyebrow">CONFIGURATION</div><h2>{title}</h2><p>{subtitle}</p></div><button type="button" className="icon-button" onClick={onClose}><X size={17} /></button></div>
       <div className="modal-fields">
         {isGroup && <><Field label="Group name" required value={form.name} onChange={(value) => update('name', value)} placeholder="Example: Survival" /><Field label="Description" value={form.note} onChange={(value) => update('note', value)} placeholder="What belongs in this group?" /><div className="field"><label>Accent</label><div className="swatch-row">{['mint', 'blue', 'amber', 'violet'].map((tone) => <button type="button" key={tone} className={`swatch swatch-${tone} ${form.accent === tone ? 'selected' : ''}`} onClick={() => update('accent', tone)} aria-label={tone} />)}</div></div></>}
+        {isTerminalWorkspace && <><Field label={isZh ? '工作区名称' : 'Workspace name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：日常运维' : 'Example: Daily operations'} /><div className="field"><label>{isZh ? `终端成员（${form.serverIds.length} / 4）` : `Terminal members (${form.serverIds.length} / 4)`}</label><div className="workspace-member-picker">{servers.map((server) => { const selected = form.serverIds.includes(server.id); const full = !selected && form.serverIds.length >= 4; return <button type="button" key={server.id} className={selected ? 'selected' : ''} disabled={full} onClick={() => toggleWorkspaceMember(server.id)}><span className={`workspace-member-check ${selected ? 'selected' : ''}`}>{selected && <Check size={12} />}</span><span><strong>{server.name}</strong><small>{server.groupName} · {shellLabel(server.shell, language)}</small></span></button>; })}{!servers.length && <span className="field-hint">{isZh ? '请先创建终端配置。' : 'Create a terminal configuration first.'}</span>}</div><span className="field-hint">{isZh ? '成员可留空；之后也能在终端页从单个终端菜单加入。' : 'Members are optional and can also be added from the terminal page later.'}</span></div></>}
         {isServer && <><Field label={isZh ? '终端名称' : 'Terminal name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：开发终端' : 'Example: Development'} /><Field label={isZh ? '终端类型' : 'Terminal type'} required type="select" options={shellOptions} value={form.shell} onChange={changeShell} /><Field label={isZh ? '标签' : 'Label'} value={form.label} onChange={(value) => update('label', value)} placeholder={shellLabel(form.shell, language)} /><div className="field-row"><Field label={isZh ? '分组' : 'Group'} required type="select" options={groupOptions} value={form.groupId} onChange={(value) => update('groupId', value)} /><Field label={isZh ? '服务端口' : 'Service port'} value={form.port} onChange={(value) => update('port', value)} placeholder={isZh ? '可选' : 'Optional'} /></div><div className="field"><label>{isZh ? '工作目录' : 'Working directory'}</label><div className="directory-input"><input value={form.dir} onChange={(event) => update('dir', event.target.value)} placeholder={isWslShell ? (isZh ? '留空使用 /root' : 'Leave blank for /root') : (isZh ? '留空使用 Windows 用户目录' : 'Leave blank for the Windows user directory')} /><button type="button" className="icon-button compact" onClick={pickDirectory} disabled={pickingDirectory} title={isZh ? '选择工作目录' : 'Choose working directory'} aria-label={isZh ? '选择工作目录' : 'Choose working directory'}><FolderOpen size={15} /></button></div><span className="field-hint">{isWslShell ? (wsl?.available ? `${wsl.distro || 'Ubuntu'} ${isZh ? '已连接，默认目录为 /root' : 'connected; default directory is /root'}` : (isZh ? 'WSL 当前不可用，也可以手动输入目录' : 'WSL is unavailable; you can still enter a path manually')) : (isZh ? 'Windows Shell 直接在本机运行，不经过 Ubuntu' : 'Windows shells run locally without Ubuntu')}</span></div></>}
-        {!isGroup && !isServer && <><Field label={isZh ? '指令名称' : 'Command name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：提升角色等级' : 'Example: Level up role'} /><Field label={isZh ? '终端指令' : 'Console command'} required mono value={form.command} onChange={(value) => update('command', value)} placeholder="gm level " /><div className="field"><label>{isZh ? '发送方式' : 'Send mode'}</label><div className="scope-options command-mode-options"><button type="button" className={form.executionMode === 'execute' ? 'selected' : ''} onClick={() => update('executionMode', 'execute')}><Play size={14} />{isZh ? '直接执行' : 'Execute'}</button><button type="button" className={form.executionMode === 'paste' ? 'selected' : ''} onClick={() => update('executionMode', 'paste')}><ClipboardPaste size={14} />{isZh ? '粘贴到终端' : 'Paste to terminal'}</button></div><span className="field-hint">{form.executionMode === 'paste' ? (isZh ? '不会发送回车，光标停在指令末尾。' : 'No Enter is sent; the cursor stays at the end.') : (isZh ? '发送后立即回车执行。' : 'Sends Enter and runs immediately.')}</span></div><Field label={isZh ? '说明' : 'Description'} value={form.description} onChange={(value) => update('description', value)} placeholder={isZh ? '这条指令的用途' : 'What does this command do?'} /><div className="field"><label>{isZh ? '适用范围' : 'Scope'}</label><div className="scope-options">{['Current selection', 'All services', 'Single service'].map((scope) => <button type="button" key={scope} className={form.scope === scope ? 'selected' : ''} onClick={() => update('scope', scope)}>{scope}</button>)}</div></div></>}
+        {!isGroup && !isServer && !isTerminalWorkspace && <><Field label={isZh ? '指令名称' : 'Command name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：提升角色等级' : 'Example: Level up role'} /><Field label={isZh ? '终端指令' : 'Console command'} required mono value={form.command} onChange={(value) => update('command', value)} placeholder="gm level " /><div className="field"><label>{isZh ? '发送方式' : 'Send mode'}</label><div className="scope-options command-mode-options"><button type="button" className={form.executionMode === 'execute' ? 'selected' : ''} onClick={() => update('executionMode', 'execute')}><Play size={14} />{isZh ? '直接执行' : 'Execute'}</button><button type="button" className={form.executionMode === 'paste' ? 'selected' : ''} onClick={() => update('executionMode', 'paste')}><ClipboardPaste size={14} />{isZh ? '粘贴到终端' : 'Paste to terminal'}</button></div><span className="field-hint">{form.executionMode === 'paste' ? (isZh ? '不会发送回车，光标停在指令末尾。' : 'No Enter is sent; the cursor stays at the end.') : (isZh ? '发送后立即回车执行。' : 'Sends Enter and runs immediately.')}</span></div><Field label={isZh ? '说明' : 'Description'} value={form.description} onChange={(value) => update('description', value)} placeholder={isZh ? '这条指令的用途' : 'What does this command do?'} /><div className="field"><label>{isZh ? '适用范围' : 'Scope'}</label><div className="scope-options">{['Current selection', 'All services', 'Single service'].map((scope) => <button type="button" key={scope} className={form.scope === scope ? 'selected' : ''} onClick={() => update('scope', scope)}>{scope}</button>)}</div></div></>}
       </div>
-      <div className="modal-footer"><button type="button" className="button secondary" onClick={onClose}>{isZh ? '取消' : 'Cancel'}</button><button className="button primary" type="submit"><Check size={15} />{isEditingCommand ? (isZh ? '保存修改' : 'Save changes') : (isZh ? '保存' : 'Save')}</button></div>
+      <div className="modal-footer"><button type="button" className="button secondary" onClick={onClose}>{isZh ? '取消' : 'Cancel'}</button><button className="button primary" type="submit"><Check size={15} />{isEditingCommand || isEditingWorkspace ? (isZh ? '保存修改' : 'Save changes') : (isZh ? '保存' : 'Save')}</button></div>
     </form>
   </div>;
 }

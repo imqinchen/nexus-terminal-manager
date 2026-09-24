@@ -73,6 +73,7 @@ let schedulerTimer;
 const EMPTY_CONFIG = {
   version: 1,
   groups: [],
+  terminalWorkspaces: [],
   commands: [],
   workflows: [],
   schedules: [],
@@ -144,20 +145,73 @@ function normalizeSchedule(task, fallbackId) {
   };
 }
 
+function normalizeTerminalWorkspaces(items, validServerIds) {
+  if (!Array.isArray(items)) return [];
+  const usedWorkspaceIds = new Set();
+  const normalizeThreePaneLayout = (value) => {
+    const firstRatio = Number(value?.firstRatio);
+    const secondRatio = Number(value?.secondRatio);
+    const thirdRatio = 1 - firstRatio - secondRatio;
+    return Number.isFinite(firstRatio) && Number.isFinite(secondRatio)
+      && firstRatio >= 0.2 && secondRatio >= 0.2 && thirdRatio >= 0.2
+      ? { firstRatio, secondRatio }
+      : { firstRatio: 1 / 3, secondRatio: 1 / 3 };
+  };
+  const normalizeRatio = (value) => {
+    const ratio = Number(value);
+    // Values from hand-edited JSON are configuration, not an in-progress
+    // drag.  Treat a missing or out-of-range value as the safe 50/50 layout
+    // instead of silently turning a bad value into an unexpected edge split.
+    return Number.isFinite(ratio) && ratio >= 0.3 && ratio <= 0.7 ? ratio : 0.5;
+  };
+  return items.map((workspace, index) => {
+    const baseId = safeId(workspace?.id || `workspace-${index + 1}`);
+    let id = baseId;
+    let suffix = 2;
+    while (usedWorkspaceIds.has(id)) {
+      id = safeId(`${baseId}-${suffix}`);
+      suffix += 1;
+    }
+    usedWorkspaceIds.add(id);
+    const seenServerIds = new Set();
+    const serverIds = [];
+    for (const rawServerId of Array.isArray(workspace?.serverIds) ? workspace.serverIds : []) {
+      const serverId = String(rawServerId || '');
+      if (!validServerIds.has(serverId) || seenServerIds.has(serverId)) continue;
+      seenServerIds.add(serverId);
+      serverIds.push(serverId);
+      if (serverIds.length === 4) break;
+    }
+    return {
+      id,
+      name: String(workspace?.name || `Terminal workspace ${index + 1}`).trim().slice(0, 120) || `Terminal workspace ${index + 1}`,
+      serverIds,
+      threePaneLayout: normalizeThreePaneLayout(workspace?.threePaneLayout),
+      fourPaneLayout: {
+        columnRatio: normalizeRatio(workspace?.fourPaneLayout?.columnRatio),
+        rowRatio: normalizeRatio(workspace?.fourPaneLayout?.rowRatio),
+      },
+    };
+  });
+}
+
 function normalizeConfig(raw) {
   if (!raw || typeof raw !== 'object') return clone(EMPTY_CONFIG);
   if (Array.isArray(raw.groups)) {
+    const groups = raw.groups.map((group, index) => ({
+      id: safeId(group?.id || `group-${index + 1}`),
+      name: String(group?.name || `Group ${index + 1}`),
+      note: String(group?.note || ''),
+      accent: String(group?.accent || 'mint'),
+      servers: Array.isArray(group?.servers) ? group.servers.map((server, serverIndex) => normalizeServer(server, `server-${index + 1}-${serverIndex + 1}`)) : [],
+    }));
+    const validServerIds = new Set(groups.flatMap((group) => group.servers.map((server) => server.id)));
     const config = {
       ...clone(EMPTY_CONFIG),
       ...raw,
       version: 1,
-      groups: raw.groups.map((group, index) => ({
-        id: safeId(group?.id || `group-${index + 1}`),
-        name: String(group?.name || `Group ${index + 1}`),
-        note: String(group?.note || ''),
-        accent: String(group?.accent || 'mint'),
-        servers: Array.isArray(group?.servers) ? group.servers.map((server, serverIndex) => normalizeServer(server, `server-${index + 1}-${serverIndex + 1}`)) : [],
-      })),
+      groups,
+      terminalWorkspaces: normalizeTerminalWorkspaces(raw.terminalWorkspaces, validServerIds),
       commands: Array.isArray(raw.commands) ? raw.commands : [],
       workflows: Array.isArray(raw.workflows) ? raw.workflows : [],
       schedules: Array.isArray(raw.schedules) ? raw.schedules.map((schedule, index) => normalizeSchedule(schedule, `schedule-${index + 1}`)) : [],
@@ -1462,7 +1516,11 @@ async function stopAndRemoveServer(serverId) {
     const serverIds = schedule.serverIds.filter((id) => id !== serverId);
     return { ...schedule, serverIds, enabled: serverIds.length ? schedule.enabled : false, lastError: serverIds.length ? schedule.lastError : `target terminal deleted: ${serverId}` };
   });
-  const saved = saveConfig({ ...config, groups: nextGroups, schedules: nextSchedules });
+  const nextTerminalWorkspaces = config.terminalWorkspaces.map((workspace) => ({
+    ...workspace,
+    serverIds: workspace.serverIds.filter((id) => id !== serverId),
+  }));
+  const saved = saveConfig({ ...config, groups: nextGroups, schedules: nextSchedules, terminalWorkspaces: nextTerminalWorkspaces });
   return {
     ...stopped,
     config: saved,
