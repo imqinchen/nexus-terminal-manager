@@ -4,7 +4,11 @@ Nexus Control 是一个运行在 Windows 本机上的终端与本地服务编排
 
 它适合管理服务器、测试服务、脚本任务和其他需要多个终端协作的本地项目。终端、服务、命令、编排、定时任务和日志都保存在本机，不需要云端账号；后端默认只监听 `127.0.0.1`。
 
+
+
 > **普通用户请下载正式版**：前往 [GitHub Releases](https://github.com/imqinchen/nexus-terminal-manager/releases/latest)，下载最新的 `Nexus-Control-...win-x64.zip`，解压后运行其中的 `Nexus Control.exe`。正式版已经包含 Electron 和前端资源，不需要安装 Node.js、npm 或 Vite。
+
+
 
 > 截图中的服务名、路径和数量来自离线演示数据，仅用于说明界面。实际内容以你的终端配置和运行环境为准。
 
