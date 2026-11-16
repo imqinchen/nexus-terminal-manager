@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import adminAvatar from './admin-avatar.jpg';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
@@ -487,6 +488,21 @@ function socketUrlFor(serverId, size = {}) {
   return base.toString();
 }
 
+// Space out terminal WebSocket attaches. Opening a 3/4-pane workspace used to
+// spawn several wsl.exe + tmux clients at once, which starved /api/config and
+// left later panes blank until the backend caught up.
+let nextTerminalAttachAt = 0;
+function scheduleTerminalAttach(run) {
+  const now = Date.now();
+  const delay = Math.max(0, nextTerminalAttachAt - now);
+  nextTerminalAttachAt = Math.max(now, nextTerminalAttachAt) + 280;
+  if (delay <= 0) {
+    run();
+    return 0;
+  }
+  return window.setTimeout(run, delay);
+}
+
 function removeLegacyPtyBanner(value) {
   const text = String(value || '');
   if (!/PTY\s+(?:ready|connected)\b/i.test(text)) return text;
@@ -510,53 +526,54 @@ function terminalPalette(theme) {
       scrollbarSliderBackground: '#819198aa',
       scrollbarSliderHoverBackground: '#60737bcc',
       scrollbarSliderActiveBackground: '#344950dd',
-      black: '#344a53',
-      red: '#ad2636',
+      black: '#2c4450',
+      red: '#c4122f',
       // Keep mounted-drive directory backgrounds light while preserving a
       // dark, readable foreground after xterm's contrast adjustment.
-      green: '#c7efdc',
-      yellow: '#81560a',
-      blue: '#07549c',
-      magenta: '#7043a5',
-      cyan: '#0b7184',
-      white: '#5c7079',
-      brightBlack: '#213943',
-      brightRed: '#8e1728',
-      brightGreen: '#075f4c',
-      brightYellow: '#624005',
-      brightBlue: '#084d9b',
-      brightMagenta: '#542a83',
-      brightCyan: '#075b6b',
-      brightWhite: '#172a32',
+      green: '#bdf0d6',
+      yellow: '#8a5c00',
+      blue: '#0057c2',
+      magenta: '#7b2fbd',
+      cyan: '#00738c',
+      white: '#4d6570',
+      brightBlack: '#122f3c',
+      brightRed: '#9c0022',
+      brightGreen: '#00624a',
+      brightYellow: '#674100',
+      brightBlue: '#00459e',
+      brightMagenta: '#5a1a99',
+      brightCyan: '#00596b',
+      brightWhite: '#0d2530',
     };
   }
   return {
-    background: '#0b1218',
-    foreground: '#e7f2f1',
-    cursor: '#75d8bd',
-    selectionBackground: '#2d5e55',
+    background: '#0a1016',
+    foreground: '#f5f9fc',
+    cursor: '#7ef5d4',
+    selectionBackground: '#28695c',
     scrollbarSliderBackground: '#81939d99',
     scrollbarSliderHoverBackground: '#a9bcc2cc',
     scrollbarSliderActiveBackground: '#d5e2e4dd',
-    black: '#7f949b',
-    red: '#ff9c9c',
-    // WSL mounted drives commonly emit 34;42 (blue on green). Keep the
-    // background subdued; xterm lifts the foreground to a readable value.
-    green: '#195642',
-    yellow: '#ffd37a',
-    // Keep blue/cyan readable when Linux emits a colored background (for
-    // example dircolors' 34;42 writable-directory style).
-    blue: '#8fc3ff',
-    magenta: '#d3b8ff',
-    cyan: '#a4eef0',
-    white: '#e7f2f1',
-    brightBlack: '#9aadb2',
-    brightRed: '#ffb3b3',
-    brightGreen: '#9cf2d8',
-    brightYellow: '#ffe39a',
-    brightBlue: '#d2deff',
-    brightMagenta: '#e4d1ff',
-    brightCyan: '#d2fbfc',
+    black: '#7c8b96',
+    red: '#ff5c5c',
+    // WSL mounted drives commonly emit 34;42 (blue on green). Green is still
+    // the directory background there, so it stays deep enough to read on.
+    green: '#20c97a',
+    yellow: '#ffc93c',
+    // Linux emits colored backgrounds too (for example dircolors' 34;42 for
+    // writable directories). minimumContrastRatio lifts the foreground when
+    // that background is bright, so these can stay fully saturated.
+    blue: '#4d9dff',
+    magenta: '#c77dff',
+    cyan: '#2ad4e6',
+    white: '#e8eff5',
+    brightBlack: '#99a7b1',
+    brightRed: '#ff8a8a',
+    brightGreen: '#5cf0ae',
+    brightYellow: '#ffd873',
+    brightBlue: '#82baff',
+    brightMagenta: '#dda6ff',
+    brightCyan: '#7ff0f8',
     brightWhite: '#ffffff',
   };
 }
@@ -798,7 +815,7 @@ function App() {
         // A later edit/delete already owns the canonical config.  Do not send
         // this captured older React state after it.
         if (savingRevision !== configEditRevisionRef.current) return null;
-        return backendRequest('/api/config', { method: 'PUT', body: payload });
+        return backendRequest('/api/config', { method: 'PUT', body: payload, timeout: 15000 });
       });
     configWriteQueueRef.current = write.catch(() => undefined);
     return write;
@@ -808,7 +825,7 @@ function App() {
     if (configReloading) return;
     setConfigReloading(true);
     try {
-      const payload = await backendRequest('/api/config/reload', { method: 'POST' });
+      const payload = await backendRequest('/api/config/reload', { method: 'POST', timeout: 15000 });
       applyBackendConfig(payload, true);
       if (notify) showToast('已从 servers.json 重新加载配置');
     } catch (error) {
@@ -823,7 +840,7 @@ function App() {
     const load = () => {
       const requestedAtRevision = configEditRevisionRef.current;
       const requestedAtSyncEpoch = configSyncEpochRef.current;
-      return backendRequest('/api/config').then((payload) => {
+      return backendRequest('/api/config', { timeout: 10000 }).then((payload) => {
         if (!alive) return;
         if (configDirtyRef.current) {
           setBackendReady(true);
@@ -1526,7 +1543,7 @@ function App() {
         <div className="sidebar-bottom">
             <button className={`nav-item ${activeNav === 'settings' ? 'active' : ''}`} onClick={() => setActiveNav('settings')}><Settings2 size={17} strokeWidth={1.8} /><span>{language === 'zh-CN' ? '设置' : 'Settings'}</span></button>
           <button className="nav-item" onClick={openHelpDocument}><CircleHelp size={17} strokeWidth={1.8} /><span>帮助与文档</span></button>
-          <div className="profile-chip"><div className="profile-avatar">A</div><div><strong>admin</strong><span>本地管理员</span></div><MoreHorizontal size={16} /></div>
+          <div className="profile-chip"><div className="profile-avatar"><img src={adminAvatar} alt="管理员头像" style={{ width: '100%', height: '100%', objectFit: 'cover' }} /></div><div><strong>admin</strong><span>本地管理员</span></div><MoreHorizontal size={16} /></div>
         </div>
       </aside>
 
@@ -1541,7 +1558,7 @@ function App() {
             <div className={`connection-pill ${wsl.backend ? '' : 'offline'}`}><span className="connection-dot" />{wsl.backend ? `本地后端 · 已连接${wsl.available ? ` · ${wsl.distro}` : ''}` : '本地后端离线'}</div>
             <button className="icon-button" onClick={() => reloadBackendConfig()} disabled={!backendReady || configReloading} title="从 servers.json 重新加载配置" aria-label="从 servers.json 重新加载配置"><RefreshCw size={16} className={configReloading ? 'spin' : ''} /></button>
             <div className="topbar-divider" />
-            <button className="icon-button" title="打开帮助" onClick={openHelpDocument}><CircleHelp size={17} /></button>
+            <button className="icon-button" title={theme === 'light' ? (language === 'zh-CN' ? '切换为深色模式' : 'Switch to dark mode') : (language === 'zh-CN' ? '切换为浅色模式' : 'Switch to light mode')} aria-label={theme === 'light' ? (language === 'zh-CN' ? '切换为深色模式' : 'Switch to dark mode') : (language === 'zh-CN' ? '切换为浅色模式' : 'Switch to light mode')} onClick={() => setTheme((current) => current === 'light' ? 'dark' : 'light')}>{theme === 'light' ? <Moon size={17} /> : <Sun size={17} />}</button>
             <button className="avatar-button" title="账户设置">A</button>
           </div>
         </header>
@@ -1697,6 +1714,31 @@ function ServiceManagementPage({ groups, servers, selectedIds, collapsedGroups, 
 function SettingsPage({ language, theme, closePromptDisabled, closeBehavior, backendReady, backendHealth, wsl, onLanguageChange, onThemeChange, onClosePromptChange, onCloseBehaviorChange, onReloadConfig, onRuntimeHealth, onNotify }) {
   const isZh = language === 'zh-CN';
   const fixedPath = 'backend/servers.json';
+  const [mcpScriptPath, setMcpScriptPath] = useState(() => loadLocalState('nexus.mcpScriptPath', ''));
+  const [mcpAllowCommands, setMcpAllowCommands] = useState(() => loadLocalState('nexus.mcpAllowCommands', false) === true);
+  const mcpConfig = JSON.stringify({
+    mcpServers: {
+      'nexus-local': {
+        command: 'node',
+        args: [mcpScriptPath.trim() || '/absolute/path/to/mcp/server.cjs'],
+        env: {
+          ...(backendHealth?.configPath ? { NEXUS_CONFIG_PATH: backendHealth.configPath } : {}),
+          ...(backendHealth?.logDir ? { NEXUS_LOG_DIR: backendHealth.logDir } : {}),
+          ...(backendHealth?.port ? { NEXUS_PTY_PORT: String(backendHealth.port) } : {}),
+          NEXUS_MCP_ALLOW_COMMANDS: mcpAllowCommands ? '1' : '0',
+        },
+      },
+    },
+  }, null, 2);
+  const copyMcpConfig = async () => {
+    try {
+      if (window.desktop?.copyText) await window.desktop.copyText(mcpConfig);
+      else await navigator.clipboard.writeText(mcpConfig);
+      onNotify?.(isZh ? '已复制 MCP 配置' : 'MCP configuration copied');
+    } catch {
+      onNotify?.(isZh ? '复制失败，请手动复制配置' : 'Copy failed; copy the configuration manually', 'warning');
+    }
+  };
   const [installingTmux, setInstallingTmux] = useState(false);
   const [tmuxInstallError, setTmuxInstallError] = useState('');
   const tmuxAvailable = backendHealth?.capabilities?.tmux === true;
@@ -1783,6 +1825,17 @@ function SettingsPage({ language, theme, closePromptDisabled, closeBehavior, bac
         </div>
       </section>
 
+      <section className="settings-section settings-wide panel">
+        <div className="panel-heading"><div><h3>{isZh ? 'Agent 接入（MCP）' : 'Agent integration (MCP)'}</h3><span>{isZh ? '通过 stdio MCP 让外部 Agent 读取日志、检索输出及发送终端命令。' : 'Expose logs, search, and terminal commands to external agents through stdio MCP.'}</span></div><Terminal size={18} className="panel-heading-icon" /></div>
+        <div className="settings-fields">
+          <div className="field"><label htmlFor="mcp-script-path">{isZh ? 'MCP 入口文件绝对路径' : 'Absolute MCP entry file path'}</label><input id="mcp-script-path" value={mcpScriptPath} placeholder={isZh ? '选择项目内 mcp/server.cjs 的完整路径' : 'Full path to mcp/server.cjs'} onChange={(event) => { setMcpScriptPath(event.target.value); window.localStorage.setItem('nexus.mcpScriptPath', JSON.stringify(event.target.value)); }} /></div>
+          <label className="settings-checkbox-row"><input type="checkbox" checked={mcpAllowCommands} onChange={(event) => { setMcpAllowCommands(event.target.checked); window.localStorage.setItem('nexus.mcpAllowCommands', JSON.stringify(event.target.checked)); }} /><span><strong>{isZh ? '允许 Agent 发送终端命令' : 'Allow agents to send terminal commands'}</strong><small>{isZh ? '默认关闭，仅查看日志。开启后生成的配置会启用命令执行；每次调用仍需 confirm=true。' : 'Off by default for log access only. Generated configuration enables commands when checked; each call still requires confirm=true.'}</small></span></label>
+          <span className="field-hint">{isZh ? '这里只保存接入配置并生成示例，不会自动启动或连接 Agent。复制到支持 mcpServers 格式的客户端后重启 MCP 服务生效；其他客户端按其配置格式填写 command、args 和环境变量。需要已安装 Node.js；发送命令时 Nexus 后端必须运行。' : 'These preferences generate a configuration example; they do not start or connect an agent. Copy into a client supporting mcpServers and restart its MCP server. Adapt command, args, and environment for other clients. Node.js is required; sending commands requires the Nexus backend.'}</span>
+          <div className="field"><label>{isZh ? '客户端配置示例' : 'Client configuration example'}</label><textarea readOnly value={mcpConfig} rows={15} aria-label={isZh ? 'MCP 配置示例' : 'MCP configuration example'} style={{ width: '100%', fontFamily: 'monospace', resize: 'vertical' }} /></div>
+          <button type="button" className="button secondary" disabled={!mcpScriptPath.trim()} onClick={copyMcpConfig}><Copy size={15} />{isZh ? '复制 MCP 配置' : 'Copy MCP configuration'}</button>
+        </div>
+      </section>
+
       <section className="settings-section panel settings-safety">
         <div className="panel-heading"><div><h3>{isZh ? '运行说明' : 'Runtime notes'}</h3><span>{isZh ? 'Nexus 不会在未经确认时修改 WSL 或 Windows 配置。' : 'Nexus does not change WSL or Windows configuration without confirmation.'}</span></div><CircleHelp size={18} className="panel-heading-icon" /></div>
         <div className="settings-notes"><p>{isZh ? '语言和主题设置保存在浏览器本地，不写入 server.json。' : 'Language and theme preferences are stored locally in the UI and are not written to server.json.'}</p><p>{isZh ? '只有主动确认“一键安装 tmux”时，应用才会修改选中的 Ubuntu 软件包。' : 'Ubuntu packages are changed only after you explicitly confirm the tmux installation.'}</p><p>{isZh ? '后端不可用时，界面会保留离线预览终端。' : 'When the backend is unavailable, the offline preview terminal remains available.'}</p><p>{isZh ? '应用退出会停止后端调度器，但不会删除 tmux 服务会话。' : 'Exiting the app stops the backend scheduler but keeps tmux service sessions intact.'}</p></div>
@@ -1861,15 +1914,18 @@ function TerminalPage({ servers, activeServer, activeServerId, setActiveServerId
 
 function RealTerminalPage({ theme, servers, terminalWorkspaces, terminalView, visibleServers, activeServerId, terminalQueries, setTerminalQuery, onSelectSingleTerminal, onSelectWorkspace, onFocusTerminal, onCreateWorkspace, onEditWorkspace, onDeleteWorkspace, onAddTerminalToWorkspace, onThreePaneLayoutChange, onFourPaneLayoutChange, onSend, commands, onUseCommand, pendingPaste, onPasteComplete, onAddService }) {
   const [workspaceMenu, setWorkspaceMenu] = useState(null);
-  const [openServerMenuId, setOpenServerMenuId] = useState('');
+  const [serverMenu, setServerMenu] = useState(null);
   const selectedWorkspace = terminalView.type === 'workspace'
     ? terminalWorkspaces.find((workspace) => workspace.id === terminalView.id)
     : null;
   const selectWorkspace = (workspaceId) => {
-    if (onSelectWorkspace(workspaceId)) setWorkspaceMenu(null);
+    if (onSelectWorkspace(workspaceId)) {
+      setWorkspaceMenu(null);
+      setServerMenu(null);
+    }
   };
   const selectSingleTerminal = (serverId) => {
-    if (onSelectSingleTerminal(serverId)) setOpenServerMenuId('');
+    if (onSelectSingleTerminal(serverId)) setServerMenu(null);
   };
   const activeVisibleServer = visibleServers.find((server) => server.id === activeServerId) || visibleServers[0] || null;
   const viewTitle = selectedWorkspace?.name || activeVisibleServer?.name || '终端';
@@ -1889,13 +1945,34 @@ function RealTerminalPage({ theme, servers, terminalWorkspaces, terminalView, vi
     setWorkspaceMenu((current) => current?.id === workspace.id ? null : { id: workspace.id, left, top });
   };
 
+  const openServerMenu = (server, event) => {
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const width = 206;
+    const menuHeight = Math.min(245, 54 + Math.max(1, terminalWorkspaces.length) * 44);
+    const gap = 6;
+    const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
+    const top = rect.bottom + menuHeight + gap <= window.innerHeight - 8
+      ? rect.bottom + gap
+      : Math.max(8, rect.top - menuHeight - gap);
+    setServerMenu((current) => current?.id === server.id ? null : { id: server.id, left, top });
+  };
+
   useEffect(() => {
-    const closeMenu = () => setWorkspaceMenu(null);
+    const closeMenu = () => {
+      setWorkspaceMenu(null);
+      setServerMenu(null);
+    };
     window.addEventListener('resize', closeMenu);
-    return () => window.removeEventListener('resize', closeMenu);
+    window.addEventListener('scroll', closeMenu, true);
+    return () => {
+      window.removeEventListener('resize', closeMenu);
+      window.removeEventListener('scroll', closeMenu, true);
+    };
   }, []);
 
   const menuWorkspace = workspaceMenu ? terminalWorkspaces.find((workspace) => workspace.id === workspaceMenu.id) : null;
+  const menuServer = serverMenu ? servers.find((server) => server.id === serverMenu.id) : null;
   return <>
     <PageIntro eyebrow="INTERACTIVE SHELL" title="终端" description="选择终端工作区查看分屏，或点击单个终端进入单屏。工作区最多包含 4 个终端。" />
     <div className="terminal-layout">
@@ -1911,8 +1988,7 @@ function RealTerminalPage({ theme, servers, terminalWorkspaces, terminalView, vi
         <div className="terminal-sidebar-heading terminal-all-heading"><span>全部终端</span><button className="icon-button compact" onClick={onAddService} title="新建终端配置" aria-label="新建终端配置"><Plus size={15} /></button></div>
         <div className="terminal-session-list terminal-all-session-list">{servers.map((server) => <div className="terminal-session-wrap" key={server.id}>
           <button className={`terminal-session ${terminalView.type === 'single' && terminalView.id === server.id ? 'active' : ''} ${activeServerId === server.id && terminalView.type === 'workspace' ? 'focused' : ''}`} onClick={() => selectSingleTerminal(server.id)} title={`以单终端视图打开 ${server.name}`}><span className={`session-dot ${server.status}`} /><span className="session-name"><strong>{server.name}</strong><small>{server.groupName} · {shellLabel(server.shell)}</small></span><span className="session-state">{server.status === 'running' ? 'live' : statusMeta[server.status].label}</span></button>
-          <button className="icon-button compact terminal-session-more" onClick={(event) => { event.stopPropagation(); setOpenServerMenuId((current) => current === server.id ? '' : server.id); }} title={`添加 ${server.name} 到工作区`} aria-label={`添加 ${server.name} 到工作区`}><MoreHorizontal size={15} /></button>
-          {openServerMenuId === server.id && <div className="terminal-side-menu terminal-server-menu"><strong>添加到工作区</strong>{terminalWorkspaces.map((workspace) => { const exists = workspace.serverIds.includes(server.id); const full = workspace.serverIds.length >= 4; return <button key={workspace.id} disabled={exists || full} onClick={() => { onAddTerminalToWorkspace(server.id, workspace.id); setOpenServerMenuId(''); }}><Plus size={14} /><span>{workspace.name}</span><small>{exists ? '已加入' : full ? '已满' : `${workspace.serverIds.length} / 4`}</small></button>; })}{!terminalWorkspaces.length && <span>请先新建终端工作区</span>}</div>}
+          <button className="icon-button compact terminal-session-more" onClick={(event) => openServerMenu(server, event)} title={`添加 ${server.name} 到工作区`} aria-label={`添加 ${server.name} 到工作区`}><MoreHorizontal size={15} /></button>
         </div>)}</div>
         <TerminalCommandBar commands={commands} onUse={onUseCommand} disabled={!activeVisibleServer} />
       </aside>
@@ -1925,6 +2001,7 @@ function RealTerminalPage({ theme, servers, terminalWorkspaces, terminalView, vi
             : visibleServers.length ? <div className={`terminal-split-grid terminal-split-${visibleServers.length}`}>{visibleServers.map((server) => <XTermPanel key={server.id} theme={theme} server={server} focused={activeServerId === server.id} onFocus={onFocusTerminal} query={terminalQueries[server.id] || ''} setQuery={(value) => setTerminalQuery(server.id, value)} onSend={onSend} pendingPaste={pendingPaste?.serverId === server.id ? pendingPaste : null} onPasteComplete={onPasteComplete} />)}</div> : <div className="terminal-workspace-empty panel"><Layers3 size={27} /><strong>{selectedWorkspace ? '此终端工作区为空' : '没有可用终端'}</strong><span>{selectedWorkspace ? '通过左侧终端的更多菜单，将终端加入此工作区。' : '新建一个终端配置后即可开始使用。'}</span></div>}
       </section>
     </div>
+    {menuServer && createPortal(<div className="terminal-side-menu terminal-server-menu terminal-floating-menu" style={{ top: serverMenu.top, left: serverMenu.left }}><strong>添加到工作区</strong>{terminalWorkspaces.map((workspace) => { const exists = workspace.serverIds.includes(menuServer.id); const full = workspace.serverIds.length >= 4; return <button key={workspace.id} disabled={exists || full} onClick={() => { onAddTerminalToWorkspace(menuServer.id, workspace.id); setServerMenu(null); }}><Plus size={14} /><span>{workspace.name}</span><small>{exists ? '已加入' : full ? '已满' : `${workspace.serverIds.length} / 4`}</small></button>; })}{!terminalWorkspaces.length && <span>请先新建终端工作区</span>}</div>, document.body)}
     {menuWorkspace && createPortal(<div className="terminal-side-menu terminal-workspace-menu terminal-floating-menu" style={{ top: workspaceMenu.top, left: workspaceMenu.left }}><button onClick={() => { onEditWorkspace(menuWorkspace); setWorkspaceMenu(null); }}><Pencil size={14} />编辑成员与名称</button><button className="danger" onClick={() => { onDeleteWorkspace(menuWorkspace.id); setWorkspaceMenu(null); }}><Trash2 size={14} />删除工作区</button></div>, document.body)}
   </>;
 }
@@ -2166,8 +2243,12 @@ function XTermPanel({ theme, server, focused = false, onFocus, query, setQuery, 
       fontWeight: 500,
       lineHeight: 1.35,
        // WSL `dircolors` uses background styles such as 34;42 for writable
-       // directories. Use a strong ratio so those labels remain readable.
-       minimumContrastRatio: 7,
+       // directories, so keep some contrast correction for colored
+       // backgrounds. A higher ratio makes xterm lighten every palette color
+       // toward white on a dark canvas, which drains the ANSI colors until
+       // they look like pastels; 4.5 keeps colored labels readable without
+       // bleaching ordinary output.
+       minimumContrastRatio: 4.5,
       // Keep a useful amount of scrollback for output produced during this
       // attachment. A tmux rebind also restores recent history into it.
       scrollback: 10000,
@@ -2407,6 +2488,7 @@ function XTermPanel({ theme, server, focused = false, onFocus, query, setQuery, 
     // tmux 2.x.
     fit.fit();
     let reconnectTimer = 0;
+    let attachTimer = 0;
     let reconnectAttempt = 0;
     let resizeFrame = 0;
     let initialResizeTimer = 0;
@@ -2544,7 +2626,9 @@ function XTermPanel({ theme, server, focused = false, onFocus, query, setQuery, 
         if (event.code === 4001) return;
         const retryDelay = Math.min(5000, 500 * (2 ** reconnectAttempt));
         reconnectAttempt += 1;
-        reconnectTimer = window.setTimeout(openSocket, retryDelay);
+        reconnectTimer = window.setTimeout(() => {
+          attachTimer = scheduleTerminalAttach(openSocket);
+        }, retryDelay);
       };
       socket.onerror = () => {
         if (disposed || socketRef.current !== socket) return;
@@ -2564,13 +2648,14 @@ function XTermPanel({ theme, server, focused = false, onFocus, query, setQuery, 
     // terminal host its final dimensions before they enter the handshake URL.
     initialResizeTimer = window.setTimeout(() => {
       fit.fit();
-      openSocket();
+      attachTimer = scheduleTerminalAttach(openSocket);
       resize();
     }, 0);
     return () => {
       disposed = true;
       fallback.connected = false;
       window.clearTimeout(reconnectTimer);
+      window.clearTimeout(attachTimer);
       window.clearTimeout(initialResizeTimer);
       window.clearTimeout(handshakeResizeTimer);
       focusTimers.forEach((timer) => window.clearTimeout(timer));
@@ -2640,7 +2725,7 @@ function XTermPanel({ theme, server, focused = false, onFocus, query, setQuery, 
       ? <><RefreshCw size={13} className="spin" /> 正在同步终端画面</>
       : <><WifiOff size={13} /> 本地预览 · 等待终端后端</>;
   const connectionClass = connection === 'connected' ? 'pty-connected' : connection === 'connecting' ? 'pty-connecting' : 'pty-preview';
-  return <div className={`terminal-main panel ${focused ? 'is-focused' : ''}`} onPointerDown={() => onFocus?.(server.id)}><div className="terminal-toolbar"><div className="terminal-target"><span className={`terminal-live-dot ${connection === 'connected' ? '' : 'preview'}`} /><strong>{server.name}</strong><span>{shellLabel(server.shell)} · {server.dir || '默认用户目录'}</span></div><div className="terminal-tools"><label className="terminal-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索终端输出" />{query && <button onClick={() => setQuery('')}><X size={13} /></button>}</label><button className="icon-button compact" onClick={() => searchRef.current?.findPrevious(query)} title="上一个匹配"><ChevronDown size={15} className="rotate-180" /></button><button className="icon-button compact" onClick={() => searchRef.current?.findNext(query)} title="下一个匹配"><ChevronDown size={15} /></button><button className="icon-button compact" onClick={copyTerminalSelection} disabled={!selectionAvailable} title="复制选中内容 (Ctrl+Shift+C)"><Copy size={14} /></button><button className="icon-button compact" onClick={() => terminalRef.current?.clear()} title="清空终端"><TrashIcon /></button></div></div><div className="xterm-host" ref={hostRef} /><div className="terminal-footer"><span className={connectionClass}>{connectionLabel}</span><span>{copyState === 'copied' ? '已复制选中内容' : copyState === 'failed' ? '复制失败' : copyState === 'pasted' ? '已粘贴，按 Enter 执行' : copyState === 'paste-failed' ? '粘贴失败' : '右键粘贴 · Ctrl+V / Ctrl+Shift+V / Shift+Insert'}</span><span>UTF-8</span><span>{terminalRef.current ? `PTY ${terminalRef.current.cols} × ${terminalRef.current.rows}` : 'PTY'}</span></div></div>;
+  return <div className={`terminal-main panel ${focused ? 'is-focused' : ''}`} onPointerDown={() => onFocus?.(server.id)}><div className="terminal-toolbar"><div className="terminal-target"><span className={`terminal-live-dot ${connection === 'connected' ? '' : 'preview'}`} /><strong>{server.name}</strong><span>{shellLabel(server.shell)} · {server.dir || '默认用户目录'}</span></div><div className="terminal-tools"><label className="terminal-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索终端输出" />{query && <button onClick={() => setQuery('')}><X size={13} /></button>}</label><button className="icon-button compact" onClick={() => searchRef.current?.findPrevious(query)} title="上一个匹配"><ChevronDown size={15} className="rotate-180" /></button><button className="icon-button compact" onClick={() => searchRef.current?.findNext(query)} title="下一个匹配"><ChevronDown size={15} /></button><button className="icon-button compact" onClick={copyTerminalSelection} disabled={!selectionAvailable} title="复制选中内容 (Ctrl+Shift+C)"><Copy size={14} /></button><button className="icon-button compact" onClick={() => { terminalRef.current?.reset(); backendRequest(`/api/servers/${encodeURIComponent(server.id)}/log/clear`, { method: 'POST', timeout: 8000 }).catch(() => undefined); }} title="清空终端"><TrashIcon /></button></div></div><div className="xterm-host" ref={hostRef} /><div className="terminal-footer"><span className={connectionClass}>{connectionLabel}</span><span>{copyState === 'copied' ? '已复制选中内容' : copyState === 'failed' ? '复制失败' : copyState === 'pasted' ? '已粘贴，按 Enter 执行' : copyState === 'paste-failed' ? '粘贴失败' : '右键粘贴 · Ctrl+V / Ctrl+Shift+V / Shift+Insert'}</span><span>UTF-8</span><span>{terminalRef.current ? `PTY ${terminalRef.current.cols} × ${terminalRef.current.rows}` : 'PTY'}</span></div></div>;
 }
 
 function TrashIcon() { return <span className="trash-icon" />; }
@@ -3197,7 +3282,13 @@ function CreationModal({ language = 'zh-CN', type, groups, servers = [], wsl, te
         executionMode: initialCommand?.executionMode === 'paste' ? 'paste' : 'execute',
       });
   const [pickingDirectory, setPickingDirectory] = useState(false);
-  const update = (key, value) => setForm((current) => ({ ...current, [key]: value }));
+  const [formError, setFormError] = useState('');
+  const workspaceNameRef = useRef(null);
+  const nameFieldRef = useRef(null);
+  const update = (key, value) => {
+    if ((key === 'name' || key === 'command') && String(value).trim()) setFormError('');
+    setForm((current) => ({ ...current, [key]: value }));
+  };
   const toggleWorkspaceMember = (serverId) => setForm((current) => {
     const serverIds = Array.isArray(current.serverIds) ? current.serverIds : [];
     if (serverIds.includes(serverId)) return { ...current, serverIds: serverIds.filter((id) => id !== serverId) };
@@ -3219,6 +3310,33 @@ function CreationModal({ language = 'zh-CN', type, groups, servers = [], wsl, te
   };
   const submit = (event) => {
     event.preventDefault();
+    if (isTerminalWorkspace && !String(form.name || '').trim()) {
+      setFormError(isZh ? '请输入工作区名称' : 'Enter a workspace name');
+      workspaceNameRef.current?.focus();
+      return;
+    }
+    if (isServer && !String(form.name || '').trim()) {
+      setFormError(isZh ? '请输入终端名称' : 'Enter a terminal name');
+      nameFieldRef.current?.focus();
+      return;
+    }
+    if (isGroup && !String(form.name || '').trim()) {
+      setFormError(isZh ? '请输入分组名称' : 'Enter a group name');
+      nameFieldRef.current?.focus();
+      return;
+    }
+    if (!isGroup && !isServer && !isTerminalWorkspace) {
+      if (!String(form.name || '').trim()) {
+        setFormError(isZh ? '请输入指令名称' : 'Enter a command name');
+        nameFieldRef.current?.focus();
+        return;
+      }
+      if (!String(form.command || '').trim()) {
+        setFormError(isZh ? '请输入终端指令' : 'Enter a console command');
+        nameFieldRef.current?.focus();
+        return;
+      }
+    }
     onCreate(form);
   };
   const shellOptions = [
@@ -3236,21 +3354,21 @@ function CreationModal({ language = 'zh-CN', type, groups, servers = [], wsl, te
   const title = isTerminalWorkspace ? (isEditingWorkspace ? (isZh ? '编辑终端工作区' : 'Edit terminal workspace') : (isZh ? '新建终端工作区' : 'New terminal workspace')) : isGroup ? (isZh ? '新建服务分组' : 'New service group') : isServer ? (isZh ? '新建终端' : 'New terminal') : isEditingCommand ? (isZh ? '编辑指令' : 'Edit command') : (isZh ? '保存指令' : 'Save command');
   const subtitle = isTerminalWorkspace ? (isZh ? '工作区与服务分组相互独立，同一终端可加入多个工作区；每组最多四个终端。' : 'Workspaces are separate from service groups. A terminal can be in multiple workspaces; each has up to four terminals.') : isGroup ? (isZh ? '创建一个用于归类本地终端的分组。' : 'Create a group for related local terminals.') : isServer ? (isZh ? '选择终端类型和工作目录；目录留空时使用该终端的默认目录。' : 'Choose a terminal type and working directory, or leave it blank for the default.') : (isEditingCommand ? (isZh ? '修改指令内容、说明和发送方式。' : 'Update the command, description, and send mode.') : (isZh ? '保存可直接执行或粘贴后补充参数的指令。' : 'Save a command to execute or paste before adding parameters.'));
   return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-    <form className="creation-modal" onSubmit={submit}>
+    <form className="creation-modal" onSubmit={submit} noValidate>
       <div className="modal-header"><div><div className="eyebrow">CONFIGURATION</div><h2>{title}</h2><p>{subtitle}</p></div><button type="button" className="icon-button" onClick={onClose}><X size={17} /></button></div>
       <div className="modal-fields">
-        {isGroup && <><Field label="Group name" required value={form.name} onChange={(value) => update('name', value)} placeholder="Example: Survival" /><Field label="Description" value={form.note} onChange={(value) => update('note', value)} placeholder="What belongs in this group?" /><div className="field"><label>Accent</label><div className="swatch-row">{['mint', 'blue', 'amber', 'violet'].map((tone) => <button type="button" key={tone} className={`swatch swatch-${tone} ${form.accent === tone ? 'selected' : ''}`} onClick={() => update('accent', tone)} aria-label={tone} />)}</div></div></>}
-        {isTerminalWorkspace && <><Field label={isZh ? '工作区名称' : 'Workspace name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：日常运维' : 'Example: Daily operations'} /><div className="field"><label>{isZh ? `终端成员（${form.serverIds.length} / 4）` : `Terminal members (${form.serverIds.length} / 4)`}</label><div className="workspace-member-picker">{servers.map((server) => { const selected = form.serverIds.includes(server.id); const full = !selected && form.serverIds.length >= 4; return <button type="button" key={server.id} className={selected ? 'selected' : ''} disabled={full} onClick={() => toggleWorkspaceMember(server.id)}><span className={`workspace-member-check ${selected ? 'selected' : ''}`}>{selected && <Check size={12} />}</span><span><strong>{server.name}</strong><small>{server.groupName} · {shellLabel(server.shell, language)}</small></span></button>; })}{!servers.length && <span className="field-hint">{isZh ? '请先创建终端配置。' : 'Create a terminal configuration first.'}</span>}</div><span className="field-hint">{isZh ? '成员可留空；之后也能在终端页从单个终端菜单加入。' : 'Members are optional and can also be added from the terminal page later.'}</span></div></>}
-        {isServer && <><Field label={isZh ? '终端名称' : 'Terminal name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：开发终端' : 'Example: Development'} /><Field label={isZh ? '终端类型' : 'Terminal type'} required type="select" options={shellOptions} value={form.shell} onChange={changeShell} /><Field label={isZh ? '标签' : 'Label'} value={form.label} onChange={(value) => update('label', value)} placeholder={shellLabel(form.shell, language)} /><div className="field-row"><Field label={isZh ? '分组' : 'Group'} required type="select" options={groupOptions} value={form.groupId} onChange={(value) => update('groupId', value)} /><Field label={isZh ? '服务端口' : 'Service port'} value={form.port} onChange={(value) => update('port', value)} placeholder={isZh ? '可选' : 'Optional'} /></div><div className="field"><label>{isZh ? '工作目录' : 'Working directory'}</label><div className="directory-input"><input value={form.dir} onChange={(event) => update('dir', event.target.value)} placeholder={isWslShell ? (isZh ? '留空使用 /root' : 'Leave blank for /root') : (isZh ? '留空使用 Windows 用户目录' : 'Leave blank for the Windows user directory')} /><button type="button" className="icon-button compact" onClick={pickDirectory} disabled={pickingDirectory} title={isZh ? '选择工作目录' : 'Choose working directory'} aria-label={isZh ? '选择工作目录' : 'Choose working directory'}><FolderOpen size={15} /></button></div><span className="field-hint">{isWslShell ? (wsl?.available ? `${wsl.distro || 'Ubuntu'} ${isZh ? '已连接，默认目录为 /root' : 'connected; default directory is /root'}` : (isZh ? 'WSL 当前不可用，也可以手动输入目录' : 'WSL is unavailable; you can still enter a path manually')) : (isZh ? 'Windows Shell 直接在本机运行，不经过 Ubuntu' : 'Windows shells run locally without Ubuntu')}</span></div></>}
-        {!isGroup && !isServer && !isTerminalWorkspace && <><Field label={isZh ? '指令名称' : 'Command name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：提升角色等级' : 'Example: Level up role'} /><Field label={isZh ? '终端指令' : 'Console command'} required mono value={form.command} onChange={(value) => update('command', value)} placeholder="gm level " /><div className="field"><label>{isZh ? '发送方式' : 'Send mode'}</label><div className="scope-options command-mode-options"><button type="button" className={form.executionMode === 'execute' ? 'selected' : ''} onClick={() => update('executionMode', 'execute')}><Play size={14} />{isZh ? '直接执行' : 'Execute'}</button><button type="button" className={form.executionMode === 'paste' ? 'selected' : ''} onClick={() => update('executionMode', 'paste')}><ClipboardPaste size={14} />{isZh ? '粘贴到终端' : 'Paste to terminal'}</button></div><span className="field-hint">{form.executionMode === 'paste' ? (isZh ? '不会发送回车，光标停在指令末尾。' : 'No Enter is sent; the cursor stays at the end.') : (isZh ? '发送后立即回车执行。' : 'Sends Enter and runs immediately.')}</span></div><Field label={isZh ? '说明' : 'Description'} value={form.description} onChange={(value) => update('description', value)} placeholder={isZh ? '这条指令的用途' : 'What does this command do?'} /><div className="field"><label>{isZh ? '适用范围' : 'Scope'}</label><div className="scope-options">{['Current selection', 'All services', 'Single service'].map((scope) => <button type="button" key={scope} className={form.scope === scope ? 'selected' : ''} onClick={() => update('scope', scope)}>{scope}</button>)}</div></div></>}
+        {isGroup && <><Field label={isZh ? '分组名称' : 'Group name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：生存服群' : 'Example: Survival'} inputRef={nameFieldRef} ariaInvalid={Boolean(formError)} />{formError && <div className="field-error" role="alert">{formError}</div>}<Field label={isZh ? '描述' : 'Description'} value={form.note} onChange={(value) => update('note', value)} placeholder={isZh ? '这个分组负责什么' : 'What belongs in this group?'} /><div className="field"><label>{isZh ? '标识色' : 'Accent'}</label><div className="swatch-row">{['mint', 'blue', 'amber', 'violet'].map((tone) => <button type="button" key={tone} className={`swatch swatch-${tone} ${form.accent === tone ? 'selected' : ''}`} onClick={() => update('accent', tone)} aria-label={tone} />)}</div></div></>}
+        {isTerminalWorkspace && <><Field label={isZh ? '工作区名称' : 'Workspace name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：日常运维' : 'Example: Daily operations'} inputRef={workspaceNameRef} ariaInvalid={Boolean(formError)} />{formError && <div className="field-error" role="alert">{formError}</div>}<div className="field"><label>{isZh ? `终端成员（${form.serverIds.length} / 4）` : `Terminal members (${form.serverIds.length} / 4)`}</label><div className="workspace-member-picker">{servers.map((server) => { const selected = form.serverIds.includes(server.id); const full = !selected && form.serverIds.length >= 4; return <button type="button" key={server.id} className={selected ? 'selected' : ''} disabled={full} onClick={() => toggleWorkspaceMember(server.id)}><span className={`workspace-member-check ${selected ? 'selected' : ''}`}>{selected && <Check size={12} />}</span><span><strong>{server.name}</strong><small>{server.groupName} · {shellLabel(server.shell, language)}</small></span></button>; })}{!servers.length && <span className="field-hint">{isZh ? '请先创建终端配置。' : 'Create a terminal configuration first.'}</span>}</div><span className="field-hint">{isZh ? '成员可留空；之后也能在终端页从单个终端菜单加入。' : 'Members are optional and can also be added from the terminal page later.'}</span></div></>}
+        {isServer && <><Field label={isZh ? '终端名称' : 'Terminal name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：开发终端' : 'Example: Development'} inputRef={nameFieldRef} ariaInvalid={Boolean(formError)} />{formError && <div className="field-error" role="alert">{formError}</div>}<Field label={isZh ? '终端类型' : 'Terminal type'} required type="select" options={shellOptions} value={form.shell} onChange={changeShell} /><Field label={isZh ? '标签' : 'Label'} value={form.label} onChange={(value) => update('label', value)} placeholder={shellLabel(form.shell, language)} /><div className="field-row"><Field label={isZh ? '分组' : 'Group'} required type="select" options={groupOptions} value={form.groupId} onChange={(value) => update('groupId', value)} /><Field label={isZh ? '服务端口' : 'Service port'} value={form.port} onChange={(value) => update('port', value)} placeholder={isZh ? '可选' : 'Optional'} /></div><div className="field"><label>{isZh ? '工作目录' : 'Working directory'}</label><div className="directory-input"><input value={form.dir} onChange={(event) => update('dir', event.target.value)} placeholder={isWslShell ? (isZh ? '留空使用 /root' : 'Leave blank for /root') : (isZh ? '留空使用 Windows 用户目录' : 'Leave blank for the Windows user directory')} /><button type="button" className="icon-button compact" onClick={pickDirectory} disabled={pickingDirectory} title={isZh ? '选择工作目录' : 'Choose working directory'} aria-label={isZh ? '选择工作目录' : 'Choose working directory'}><FolderOpen size={15} /></button></div><span className="field-hint">{isWslShell ? (wsl?.available ? `${wsl.distro || 'Ubuntu'} ${isZh ? '已连接，默认目录为 /root' : 'connected; default directory is /root'}` : (isZh ? 'WSL 当前不可用，也可以手动输入目录' : 'WSL is unavailable; you can still enter a path manually')) : (isZh ? 'Windows Shell 直接在本机运行，不经过 Ubuntu' : 'Windows shells run locally without Ubuntu')}</span></div></>}
+        {!isGroup && !isServer && !isTerminalWorkspace && <><Field label={isZh ? '指令名称' : 'Command name'} required value={form.name} onChange={(value) => update('name', value)} placeholder={isZh ? '例如：提升角色等级' : 'Example: Level up role'} inputRef={nameFieldRef} ariaInvalid={Boolean(formError)} />{formError && <div className="field-error" role="alert">{formError}</div>}<Field label={isZh ? '终端指令' : 'Console command'} required mono value={form.command} onChange={(value) => update('command', value)} placeholder="gm level " /><div className="field"><label>{isZh ? '发送方式' : 'Send mode'}</label><div className="scope-options command-mode-options"><button type="button" className={form.executionMode === 'execute' ? 'selected' : ''} onClick={() => update('executionMode', 'execute')}><Play size={14} />{isZh ? '直接执行' : 'Execute'}</button><button type="button" className={form.executionMode === 'paste' ? 'selected' : ''} onClick={() => update('executionMode', 'paste')}><ClipboardPaste size={14} />{isZh ? '粘贴到终端' : 'Paste to terminal'}</button></div><span className="field-hint">{form.executionMode === 'paste' ? (isZh ? '不会发送回车，光标停在指令末尾。' : 'No Enter is sent; the cursor stays at the end.') : (isZh ? '发送后立即回车执行。' : 'Sends Enter and runs immediately.')}</span></div><Field label={isZh ? '说明' : 'Description'} value={form.description} onChange={(value) => update('description', value)} placeholder={isZh ? '这条指令的用途' : 'What does this command do?'} /><div className="field"><label>{isZh ? '适用范围' : 'Scope'}</label><div className="scope-options">{['Current selection', 'All services', 'Single service'].map((scope) => <button type="button" key={scope} className={form.scope === scope ? 'selected' : ''} onClick={() => update('scope', scope)}>{scope}</button>)}</div></div></>}
       </div>
       <div className="modal-footer"><button type="button" className="button secondary" onClick={onClose}>{isZh ? '取消' : 'Cancel'}</button><button className="button primary" type="submit"><Check size={15} />{isEditingCommand || isEditingWorkspace ? (isZh ? '保存修改' : 'Save changes') : (isZh ? '保存' : 'Save')}</button></div>
     </form>
   </div>;
 }
 
-function Field({ label, required, value, onChange, placeholder, type = 'text', options = [], mono = false }) {
-  return <div className="field"><label>{label}{required && <span>*</span>}</label>{type === 'select' ? <select value={value} onChange={(event) => onChange(event.target.value)}>{options.map((option) => <option value={option.value} key={option.value} disabled={option.disabled}>{option.label}</option>)}</select> : <input className={mono ? 'mono-field' : ''} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} />}</div>;
+function Field({ label, required, value, onChange, placeholder, type = 'text', options = [], mono = false, inputRef, ariaInvalid = false }) {
+  return <div className="field"><label>{label}{required && <span>*</span>}</label>{type === 'select' ? <select value={value} onChange={(event) => onChange(event.target.value)}>{options.map((option) => <option value={option.value} key={option.value} disabled={option.disabled}>{option.label}</option>)}</select> : <input ref={inputRef} className={mono ? 'mono-field' : ''} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} required={required} aria-invalid={ariaInvalid || undefined} />}</div>;
 }
 
 export default App;

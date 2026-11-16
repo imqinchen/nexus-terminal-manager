@@ -10,6 +10,7 @@ backend/servers.json.*.tmp
 backend/logs/
 backend/node_modules/
 work/
+.codex/
 release2/
 release3/
 release-rename-test/

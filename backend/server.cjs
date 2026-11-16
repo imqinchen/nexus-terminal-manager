@@ -67,6 +67,7 @@ const TMUX_INITIAL_INPUT_LIMIT = 256 * 1024;
 const CAPABILITY_CACHE_TTL = 30000;
 const capabilityCache = { tmux: null, tmuxCheckedAt: 0, wsl: null, wslCheckedAt: 0 };
 let capabilityRefreshPromise = null;
+let shellCapabilityCache = null;
 let shutdownRequested = false;
 let schedulerTimer;
 
@@ -382,34 +383,28 @@ function logFileInfo(server, lines) {
   }
 }
 
+// Capability probes must never block the HTTP/WS event loop. A cold WSL
+// execFileSync can stall every concurrent /api/config and terminal upgrade
+// for seconds, which surfaces as "backend request timed out" and blank panes.
+function ensureCapabilityProbeStarted() {
+  if (capabilityCache.tmux === null || capabilityCache.wsl === null) {
+    void refreshCapabilitiesInBackground(true);
+  }
+}
+
 function hasTmux() {
   if (capabilityCache.tmux !== null) return capabilityCache.tmux;
-  try {
-    if (process.platform === 'win32') {
-      const distro = WSL_CONFIG.distro || 'Ubuntu';
-      execFileSync('wsl.exe', ['-d', distro, '--', 'bash', '-lc', 'command -v tmux'], { stdio: 'ignore' });
-    } else {
-      execFileSync('bash', ['-lc', 'command -v tmux'], { stdio: 'ignore' });
-    }
-    capabilityCache.tmux = true;
-  } catch {
-    capabilityCache.tmux = false;
-  }
-  capabilityCache.tmuxCheckedAt = Date.now();
-  return capabilityCache.tmux;
+  ensureCapabilityProbeStarted();
+  // Optimistic default: WSL game workspaces are expected to have tmux, and
+  // spawnTerminal's one-shot bash command still works if the probe later fails.
+  return true;
 }
 
 function hasWsl() {
   if (process.platform !== 'win32') return true;
   if (capabilityCache.wsl !== null) return capabilityCache.wsl;
-  try {
-    execFileSync('wsl.exe', ['-d', WSL_CONFIG.distro || 'Ubuntu', '--', 'true'], { stdio: 'ignore', timeout: 3000, windowsHide: true });
-    capabilityCache.wsl = true;
-  } catch {
-    capabilityCache.wsl = false;
-  }
-  capabilityCache.wslCheckedAt = Date.now();
-  return capabilityCache.wsl;
+  ensureCapabilityProbeStarted();
+  return true;
 }
 
 function refreshCapabilitiesInBackground(force = false) {
@@ -449,8 +444,10 @@ function shellQuote(value) {
 
 function runGuest(program, args, options = {}) {
   const command = process.platform === 'win32' ? 'wsl.exe' : program;
+  // --exec runs the program directly; plain `--` would pipe the joined command
+  // line through the guest login shell and let it eat (), >> and #{} in args.
   const commandArgs = process.platform === 'win32'
-    ? ['-d', WSL_CONFIG.distro || 'Ubuntu', '--', program, ...args]
+    ? ['-d', WSL_CONFIG.distro || 'Ubuntu', '--exec', program, ...args]
     : args;
   return new Promise((resolve, reject) => {
     execFile(command, commandArgs, {
@@ -524,6 +521,25 @@ async function enableTmuxLogging(server) {
   await runGuest('tmux', ['pipe-pane', '-o', '-t', session, pipeCommand], { timeout: 8000 });
 }
 
+async function clearServerLog(serverId) {
+  const server = findServer(serverId);
+  if (!server) throw new Error(`unknown server: ${serverId}`);
+  const session = server.session || `nexus-${safeId(server.id)}`;
+  if (server.shell === 'wsl' && server.tmux !== false && hasTmux() && await tmuxSessionExists(session)) {
+    // Close the pipe before truncating. Otherwise cat keeps the old offset and
+    // later output is written past the new end, so readers stay on pre-clear bytes.
+    await runGuest('tmux', ['pipe-pane', '-t', session], { timeout: 8000 }).catch(() => undefined);
+    await runGuest('tmux', ['clear-history', '-t', session], { timeout: 8000 }).catch(() => undefined);
+    await runGuest('tmux', ['send-keys', '-l', '-t', session, '\u001b[2J\u001b[3J\u001b[H'], { timeout: 8000 }).catch(() => undefined);
+  }
+  resetLog(serverId);
+  appendLog(serverId, `[Nexus terminal cleared at ${new Date().toISOString()}]\n`);
+  if (server.shell === 'wsl' && server.tmux !== false) {
+    try { await enableTmuxLogging(server); } catch { /* next attach reopens the pipe */ }
+  }
+  return { serverId, cleared: true, logFile: logPath(serverId) };
+}
+
 async function backfillTmuxHistory(server) {
   const session = server.session || `nexus-${safeId(server.id)}`;
   const { stdout } = await runGuest('tmux', ['capture-pane', '-p', '-S', '-', '-t', session], { timeout: 8000 });
@@ -591,9 +607,11 @@ function clearInitialTmuxTimers(state) {
   if (state.initialResetTimer) clearTimeout(state.initialResetTimer);
   if (state.initialMarkerTimer) clearTimeout(state.initialMarkerTimer);
   if (state.initialFallbackTimer) clearTimeout(state.initialFallbackTimer);
+  if (state.initialRebindFallbackTimer) clearTimeout(state.initialRebindFallbackTimer);
   state.initialResetTimer = null;
   state.initialMarkerTimer = null;
   state.initialFallbackTimer = null;
+  state.initialRebindFallbackTimer = null;
 }
 
 async function captureTmuxSnapshot(state, timeout = 4000, includeScrollback = false) {
@@ -606,9 +624,7 @@ async function captureTmuxSnapshot(state, timeout = 4000, includeScrollback = fa
     const captureArgs = ['capture-pane', '-e', '-p'];
     if (includeScrollback) captureArgs.push('-S', `-${TMUX_RESTORE_HISTORY_LINES}`);
     captureArgs.push('-t', session);
-    const cursorFormat = process.platform === 'win32'
-      ? '\\#{cursor_x}:\\#{cursor_y}'
-      : '#{cursor_x}:#{cursor_y}';
+    const cursorFormat = '#{cursor_x}:#{cursor_y}';
     const [paneResult, cursorResult] = await Promise.all([
       runGuest('tmux', captureArgs, { timeout, maxBuffer: 8 * 1024 * 1024 }),
       runGuest('tmux', ['display-message', '-p', '-t', session, cursorFormat], { timeout }),
@@ -903,6 +919,14 @@ function beginTmuxRendererRebind(state, webSocket, resizeRenderer = false) {
     // half-second synchronization window.
     try { state.terminal.child.resize(state.cols, state.rows); } catch { /* PTY exited */ }
   }
+  // capture-pane normally finishes within its own command timeout. Keep a
+  // separate renderer deadline as a final escape hatch: a wedged WSL process
+  // must not leave the browser in "syncing" forever.
+  state.initialRebindFallbackTimer = setTimeout(() => {
+    state.initialRebindFallbackTimer = null;
+    completeTmuxRendererRebind(state, webSocket, syncGeneration, '');
+  }, Math.max(2000, TMUX_SCREEN_SYNC_MAX_DELAY + 1000));
+  state.initialRebindFallbackTimer.unref?.();
   void restoreTmuxRendererFromSnapshot(state, webSocket, syncGeneration, cachedSnapshot).catch((error) => {
     if (process.env.NEXUS_DEBUG_PTY) console.warn(`[pty] unable to restore tmux renderer ${state.serverId || ''}: ${error.message}`);
     completeTmuxRendererRebind(state, webSocket, syncGeneration, '');
@@ -983,6 +1007,7 @@ function createWslTerminal(serverId, requestedSize = {}) {
     initialResetDone: false,
     initialResetTimer: null,
     initialFallbackTimer: null,
+    initialRebindFallbackTimer: null,
     initialResetStartedAt: 0,
     initialTmuxBuffer: '',
     initialResetSocket: null,
@@ -1068,8 +1093,10 @@ function terminateWslTerminal(serverId) {
   if (!state) return false;
   if (state.initialResetTimer) clearTimeout(state.initialResetTimer);
   if (state.initialMarkerTimer) clearTimeout(state.initialMarkerTimer);
+  if (state.initialRebindFallbackTimer) clearTimeout(state.initialRebindFallbackTimer);
   state.initialResetTimer = null;
   state.initialMarkerTimer = null;
+  state.initialRebindFallbackTimer = null;
   state.disposed = true;
   wslTerminals.delete(serverId);
   ptyConnections.delete(state.terminal);
@@ -1246,7 +1273,7 @@ async function tmuxPanePids(session) {
     // wsl.exe treats an unescaped `#` as the start of a shell comment while
     // reconstructing direct command arguments. The leading backslash is
     // removed by that outer parser before tmux receives its format string.
-    const { stdout } = await runGuest('tmux', ['list-panes', '-t', `${session}:`, '-F', '\\#{pane_pid}'], { timeout: 5000 });
+    const { stdout } = await runGuest('tmux', ['list-panes', '-t', `${session}:`, '-F', '#{pane_pid}'], { timeout: 5000 });
     return [...new Set(String(stdout || '').match(/\d+/g)?.map(Number).filter((pid) => Number.isInteger(pid) && pid > 1) || [])];
   } catch {
     return [];
@@ -1975,13 +2002,23 @@ function parseBody(request) {
   });
 }
 
-function healthPayload() {
-  reloadConfigIfChanged();
+function detectShellCapabilities() {
+  if (shellCapabilityCache) return shellCapabilityCache;
   const systemRoot = process.env.SystemRoot || 'C:\\Windows';
   const powershellPath = path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const cmdPath = path.join(systemRoot, 'System32', 'cmd.exe');
   const pathEntries = String(process.env.Path || '').split(path.delimiter).filter(Boolean);
-  const pwsh = process.platform === 'win32' && pathEntries.some((entry) => fs.existsSync(path.join(entry, 'pwsh.exe')));
+  shellCapabilityCache = {
+    powershell: process.platform === 'win32' && fs.existsSync(powershellPath),
+    pwsh: process.platform === 'win32' && pathEntries.some((entry) => fs.existsSync(path.join(entry, 'pwsh.exe'))),
+    cmd: process.platform === 'win32' && fs.existsSync(cmdPath),
+  };
+  return shellCapabilityCache;
+}
+
+function healthPayload() {
+  reloadConfigIfChanged();
+  const shells = detectShellCapabilities();
   const tmux = hasTmux();
   const wsl = hasWsl();
   refreshCapabilitiesInBackground();
@@ -2001,9 +2038,9 @@ function healthPayload() {
       node: process.version,
       platform: process.platform,
       wsl,
-      powershell: process.platform === 'win32' && fs.existsSync(powershellPath),
-      pwsh,
-      cmd: process.platform === 'win32' && fs.existsSync(cmdPath),
+      powershell: shells.powershell,
+      pwsh: shells.pwsh,
+      cmd: shells.cmd,
     },
     groups: config.groups.length,
     servers: allServers().length,
@@ -2017,7 +2054,7 @@ async function handleApi(request, response, url) {
       return json(response, 200, healthPayload());
     }
     if (request.method === 'GET' && url.pathname === '/api/config') {
-      reloadConfigIfChanged();
+      // healthPayload() reloads config when the stamp changes.
       return json(response, 200, { config: clone(config), health: healthPayload() });
     }
     if (request.method === 'POST' && url.pathname === '/api/config/reload') return json(response, 200, { config: reloadConfigFromDisk(), health: healthPayload() });
@@ -2042,6 +2079,10 @@ async function handleApi(request, response, url) {
         });
       }
       return json(response, 200, { rows: rows.slice(-limit), total: rows.length, files, limit });
+    }
+    const clearLogMatch = url.pathname.match(/^\/api\/servers\/([^/]+)\/log\/clear$/);
+    if (request.method === 'POST' && clearLogMatch) {
+      return json(response, 200, await clearServerLog(decodeURIComponent(clearLogMatch[1])));
     }
     if (request.method === 'POST' && url.pathname === '/api/servers/stop-all') {
       const result = await stopAllConfiguredServers();
@@ -2355,5 +2396,7 @@ server.listen(PORT, HOST, () => {
   console.log(`Config: ${CONFIG_PATH}`);
   console.log(`Logs: ${LOG_DIR}`);
   if (WSL_CONFIG.distro) console.log(`WSL distro: ${WSL_CONFIG.distro} (${WSL_CONFIG.source})`);
+  // Warm capability cache before the first /api/config or terminal attach.
+  void refreshCapabilitiesInBackground(true);
   void enableLoggingForExistingSessions();
 });

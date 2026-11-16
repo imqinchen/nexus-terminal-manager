@@ -19,6 +19,7 @@ let tray;
 let hiddenToTray = false;
 let closeRequestInFlight = false;
 let allowWindowClose = false;
+let rendererCrashTimes = [];
 
 const DEFAULT_APP_SETTINGS = {
   closePromptDisabled: false,
@@ -101,7 +102,7 @@ function requestBackend(endpoint, options = {}) {
       port: BACKEND_PORT,
       path: endpoint,
       method: options.method || 'GET',
-      timeout: options.timeout || 2500,
+      timeout: options.timeout || 8000,
       headers: body ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } : undefined,
     }, (response) => {
       let output = '';
@@ -386,6 +387,23 @@ async function requestClose() {
   }
 }
 
+function recoverRenderer(reason, exitCode) {
+  console.error(`[renderer] gone reason=${reason} exitCode=${exitCode}`);
+  if (quitting || reason === 'clean-exit') return;
+  const now = Date.now();
+  rendererCrashTimes = rendererCrashTimes.filter((time) => now - time < 60000).concat(now);
+  if (rendererCrashTimes.length > 3) {
+    // Reloading a renderer that dies on every attempt only hides the problem;
+    // stop looping and leave the window for a manual restart.
+    console.error('[renderer] crashed more than 3 times in 60s, auto-recovery paused');
+    return;
+  }
+  setTimeout(() => {
+    if (quitting || !mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.reload();
+  }, 800);
+}
+
 function createWindow() {
   console.log('[main] creating window');
   mainWindow = new BrowserWindow({
@@ -409,6 +427,9 @@ function createWindow() {
   else mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   mainWindow.once('ready-to-show', () => mainWindow.show());
   mainWindow.webContents.on('did-fail-load', (_event, code, description) => console.error('[renderer] failed to load', code, description));
+  mainWindow.webContents.on('render-process-gone', (_event, details) => recoverRenderer(details.reason, details.exitCode));
+  mainWindow.webContents.on('unresponsive', () => console.error('[renderer] unresponsive'));
+  mainWindow.webContents.on('responsive', () => console.error('[renderer] responsive again'));
   mainWindow.on('close', (event) => {
     if (quitting || allowWindowClose || hiddenToTray) return;
     event.preventDefault();
